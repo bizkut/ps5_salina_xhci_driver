@@ -11,14 +11,6 @@ index a07e7ba9cd53..9b39ae9cfb1f 100644
  obj-$(CONFIG_USB_XHCI_PCI_RENESAS)	+= xhci-pci-renesas.o
  obj-$(CONFIG_USB_XHCI_PLATFORM) += xhci-plat-hcd.o
  obj-$(CONFIG_USB_XHCI_HISTB)	+= xhci-histb.o
-diff --git a/drivers/usb/host/whaever b/drivers/usb/host/whaever
-new file mode 100644
-index 000000000000..3835a2483059
---- /dev/null
-+++ b/drivers/usb/host/whaever
-@@ -0,0 +1 @@
-+if (xhci->quirks & XHCI_PS5_SALINA_PHY) 
-\ No newline at end of file
 diff --git a/drivers/usb/host/xhci-hub.c b/drivers/usb/host/xhci-hub.c
 index 04cc3d681495..d52b7a20e239 100644
 --- a/drivers/usb/host/xhci-hub.c

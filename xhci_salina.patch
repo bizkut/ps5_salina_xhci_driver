@@ -1,293 +1,20 @@
-diff --git a/drivers/usb/host/Makefile b/drivers/usb/host/Makefile
-index a07e7ba9cd53..9b39ae9cfb1f 100644
---- a/drivers/usb/host/Makefile
-+++ b/drivers/usb/host/Makefile
-@@ -70,7 +70,7 @@ obj-$(CONFIG_USB_OCTEON_HCD)	+= octeon-hcd.o
- obj-$(CONFIG_USB_UHCI_HCD)	+= uhci-hcd.o
- obj-$(CONFIG_USB_FHCI_HCD)	+= fhci.o
- obj-$(CONFIG_USB_XHCI_HCD)	+= xhci-hcd.o
--obj-$(CONFIG_USB_XHCI_PCI)	+= xhci-pci.o
-+obj-$(CONFIG_USB_XHCI_PCI)	+= xhci-pci.o xhci-ps5.o
- obj-$(CONFIG_USB_XHCI_PCI_RENESAS)	+= xhci-pci-renesas.o
- obj-$(CONFIG_USB_XHCI_PLATFORM) += xhci-plat-hcd.o
- obj-$(CONFIG_USB_XHCI_HISTB)	+= xhci-histb.o
-diff --git a/drivers/usb/host/xhci-hub.c b/drivers/usb/host/xhci-hub.c
-index 04cc3d681495..d52b7a20e239 100644
---- a/drivers/usb/host/xhci-hub.c
-+++ b/drivers/usb/host/xhci-hub.c
-@@ -1279,6 +1279,33 @@ int xhci_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
- 			 hcd->self.busnum, portnum1, temp, status);
- 
- 		put_unaligned(cpu_to_le32(status), (__le32 *) buf);
-+
-+		// Salina
-+
-+	if (dev_is_pci(xhci_to_hcd(xhci)->self.sysdev)) {
-+		struct pci_dev *pdev = to_pci_dev(xhci_to_hcd(xhci)->self.sysdev);
-+
-+		if (pdev->vendor == 0x104d && pdev->device == 0x9108) {
-+			/* wIndex es el número de puerto basado en 1. El puerto 5-3 es wIndex == 3 */
-+			if (wIndex == 3 && (status & PORT_CONNECT)) {
-+				/* Acceso directo al miembro port_regs sugerido por el compilador */
-+				void __iomem *portsc_addr = &xhci->op_regs->port_regs[wIndex - 1].portsc;
-+				u32 temp_port = readl(portsc_addr);
-+
-+				/* Evaluamos con PORT_PLS_MASK y el estado operativo activo U0 (0) */
-+				if ((temp_port & PORT_PLS_MASK) != 0) {
-+					/* Neutralizar bits RWC (Read-to-Clear) para proteger otros eventos */
-+					temp_port = xhci_port_state_to_neutral(temp_port);
-+					temp_port &= ~PORT_PLS_MASK;
-+					temp_port |= 0; /* Fuerza el estado U0 de máxima energía */
-+					
-+					writel(temp_port, portsc_addr);
-+					pr_err("xHCI: Forzado enlace U0 en el puerto Marvell de la PS5 (PORTSC: 0x%08x)\n", temp_port);
-+				}
-+			}
-+		}
-+	}
-+
- 		/* if USB 3.1 extended port status return additional 4 bytes */
- 		if (wValue == 0x02) {
- 			u32 port_li;
-diff --git a/drivers/usb/host/xhci-mem.c b/drivers/usb/host/xhci-mem.c
-index 75bc1eb98b76..fbc0ae3803f5 100644
---- a/drivers/usb/host/xhci-mem.c
-+++ b/drivers/usb/host/xhci-mem.c
-@@ -463,9 +463,17 @@ struct xhci_container_ctx *xhci_alloc_container_ctx(struct xhci_hcd *xhci,
- 		return NULL;
- 
- 	ctx->type = type;
--	ctx->size = xhci->hcc_params & HCC_64BYTE_CONTEXT ? 2048 : 1024;
--	if (type == XHCI_CTX_TYPE_INPUT)
--		ctx->size += CTX_SIZE(xhci->hcc_params);
-+
-+	if (xhci->quirks & XHCI_PS5_SALINA_PHY) {
-+		ctx->size = 2048;
-+		if (type == XHCI_CTX_TYPE_INPUT)
-+			ctx->size += 64;
-+	}
-+	else {
-+		ctx->size = xhci->hcc_params & HCC_64BYTE_CONTEXT ? 2048 : 1024;
-+		if (type == XHCI_CTX_TYPE_INPUT)
-+			ctx->size += CTX_SIZE(xhci->hcc_params);
-+	}
- 
- 	ctx->bytes = dma_pool_zalloc(xhci->device_pool, flags, &ctx->dma);
- 	if (!ctx->bytes) {
-@@ -528,8 +536,14 @@ struct xhci_slot_ctx *xhci_get_slot_ctx(struct xhci_hcd *xhci,
- 	if (ctx->type == XHCI_CTX_TYPE_DEVICE)
- 		return (struct xhci_slot_ctx *)ctx->bytes;
- 
--	return (struct xhci_slot_ctx *)
--		(ctx->bytes + CTX_SIZE(xhci->hcc_params));
-+	if (xhci->quirks & XHCI_PS5_SALINA_PHY) {
-+	    return (struct xhci_slot_ctx *)
-+            (ctx->bytes + 64);
-+	}
-+	else {
-+		return (struct xhci_slot_ctx *)
-+			(ctx->bytes + CTX_SIZE(xhci->hcc_params));
-+	}
- }
- 
- struct xhci_ep_ctx *xhci_get_ep_ctx(struct xhci_hcd *xhci,
-@@ -2403,41 +2417,88 @@ int xhci_mem_init(struct xhci_hcd *xhci, gfp_t flags)
- 	struct device	*dev = xhci_to_hcd(xhci)->self.sysdev;
- 	dma_addr_t	dma;
- 
--	/*
--	 * xHCI section 5.4.6 - Device Context array must be
--	 * "physically contiguous and 64-byte (cache line) aligned".
--	 */
--	xhci->dcbaa = dma_alloc_coherent(dev, sizeof(*xhci->dcbaa), &dma, flags);
--	if (!xhci->dcbaa)
--		goto fail;
--
--	xhci->dcbaa->dma = dma;
--	xhci_dbg_trace(xhci, trace_xhci_dbg_init,
--		       "Device context base array address = 0x%pad (DMA), %p (virt)",
--		       &xhci->dcbaa->dma, xhci->dcbaa);
--
--	/*
--	 * Initialize the ring segment pool.  The ring must be a contiguous
--	 * structure comprised of TRBs.  The TRBs must be 16 byte aligned,
--	 * however, the command ring segment needs 64-byte aligned segments
--	 * and our use of dma addresses in the trb_address_map radix tree needs
--	 * TRB_SEGMENT_SIZE alignment, so we pick the greater alignment need.
--	 */
--	if (xhci->quirks & XHCI_TRB_OVERFETCH)
--		/* Buggy HC prefetches beyond segment bounds - allocate dummy space at the end */
--		xhci->segment_pool = dma_pool_create("xHCI ring segments", dev,
--				TRB_SEGMENT_SIZE * 2, TRB_SEGMENT_SIZE * 2, xhci->page_size * 2);
--	else
--		xhci->segment_pool = dma_pool_create("xHCI ring segments", dev,
--				TRB_SEGMENT_SIZE, TRB_SEGMENT_SIZE, xhci->page_size);
--	if (!xhci->segment_pool)
--		goto fail;
- 
--	/* See Table 46 and Note on Figure 55 */
--	xhci->device_pool = dma_pool_create("xHCI input/output contexts", dev, 2112, 64,
--					    xhci->page_size);
--	if (!xhci->device_pool)
--		goto fail;
-+/***** Adding Salina Customs *****/
-+
-+/* 
-+    /*
-+     * xHCI section 5.4.6 - Device Context array must be physically contiguous.
-+     * PATCH: Force the allocation size to a full 4KB page size (4096 bytes)
-+     * instead of just the bare struct size, eliminating adjacent prefetch bleeding.
-+     */
-+    xhci->dcbaa = dma_alloc_coherent(dev, PAGE_SIZE, &dma, flags);
-+    if (!xhci->dcbaa)
-+        goto fail;
-+
-+    xhci->dcbaa->dma = dma;
-+    xhci_dbg_trace(xhci, trace_xhci_dbg_init,
-+               "Device context base array address = 0x%pad (DMA), %p (virt)",
-+               &xhci->dcbaa->dma, xhci->dcbaa);
-+
-+    /*
-+     * PATCH: Force the segment pool to use 4KB strides.
-+     * We bypass the XHCI_TRB_OVERFETCH check entirely because your hardware's 
-+     * 64-byte burst completion engine behaves exactly like an overfetch bug 
-+     * if it crosses a 4KB boundary stride.
-+     */
-+    dev_info(dev, "Sony Hardware Variant: Aligning ring segments to 4KB page strides.\n");
-+    xhci->segment_pool = dma_pool_create("xHCI ring segments", dev,
-+            PAGE_SIZE, PAGE_SIZE, PAGE_SIZE);
-+            
-+    if (!xhci->segment_pool)
-+        goto fail;
-+
-+    /* 
-+     * See Table 46 and Note on Figure 55
-+     * PATCH: Linux normally allocates 2112 bytes with 64-byte alignment.
-+     * We expand the allocation block size to 4096 (PAGE_SIZE) and force 
-+     * strict 4KB alignment boundary mapping.
-+     */
-+    xhci->device_pool = dma_pool_create("xHCI input/output contexts", dev, 
-+            PAGE_SIZE, PAGE_SIZE, PAGE_SIZE);
-+            
-+    if (!xhci->device_pool)
-+        goto fail;
-+
-+
-+
-+
-+
-+//	/*
-+//	 * xHCI section 5.4.6 - Device Context array must be
-+//	 * "physically contiguous and 64-byte (cache line) aligned".
-+//	 */
-+//	xhci->dcbaa = dma_alloc_coherent(dev, sizeof(*xhci->dcbaa), &dma, flags);
-+//	if (!xhci->dcbaa)
-+//		goto fail;
-+//
-+//	xhci->dcbaa->dma = dma;
-+//	xhci_dbg_trace(xhci, trace_xhci_dbg_init,
-+//		       "Device context base array address = 0x%pad (DMA), %p (virt)",
-+//		       &xhci->dcbaa->dma, xhci->dcbaa);
-+//
-+//	/*
-+//	 * Initialize the ring segment pool.  The ring must be a contiguous
-+//	 * structure comprised of TRBs.  The TRBs must be 16 byte aligned,
-+//	 * however, the command ring segment needs 64-byte aligned segments
-+//	 * and our use of dma addresses in the trb_address_map radix tree needs
-+//	 * TRB_SEGMENT_SIZE alignment, so we pick the greater alignment need.
-+//	 */
-+//	if (xhci->quirks & XHCI_TRB_OVERFETCH)
-+//		/* Buggy HC prefetches beyond segment bounds - allocate dummy space at the end */
-+//		xhci->segment_pool = dma_pool_create("xHCI ring segments", dev,
-+//				TRB_SEGMENT_SIZE * 2, TRB_SEGMENT_SIZE * 2, xhci->page_size * 2);
-+//	else
-+//		xhci->segment_pool = dma_pool_create("xHCI ring segments", dev,
-+//				TRB_SEGMENT_SIZE, TRB_SEGMENT_SIZE, xhci->page_size);
-+//	if (!xhci->segment_pool)
-+//		goto fail;
-+//
-+//	/* See Table 46 and Note on Figure 55 */
-+//	xhci->device_pool = dma_pool_create("xHCI input/output contexts", dev, 2112, 64,
-+//					    xhci->page_size);
-+//	if (!xhci->device_pool)
-+//		goto fail;
- 
- 	/*
- 	 * Linear stream context arrays don't have any boundary restrictions,
-diff --git a/drivers/usb/host/xhci-pci.c b/drivers/usb/host/xhci-pci.c
-index 585b2f3117b0..590530fe605a 100644
---- a/drivers/usb/host/xhci-pci.c
-+++ b/drivers/usb/host/xhci-pci.c
-@@ -19,6 +19,8 @@
- #include "xhci-trace.h"
- #include "xhci-pci.h"
- 
-+#include "xhci-ps5.h"
-+
- #define SSIC_PORT_NUM		2
- #define SSIC_PORT_CFG2		0x880c
- #define SSIC_PORT_CFG2_OFFSET	0x30
-@@ -94,6 +96,9 @@
- #define PCI_DEVICE_ID_ASMEDIA_3042_XHCI			0x3042
- #define PCI_DEVICE_ID_ASMEDIA_3242_XHCI			0x3242
- 
-+#define PCI_VENDOR_ID_SONY						0x104d
-+#define PCI_DEVICE_ID_PS5_SALINA_XHCI			0x9108
-+
- static const char hcd_name[] = "xhci_hcd";
- 
- static struct hc_driver __read_mostly xhci_pci_hc_driver;
-@@ -511,6 +516,18 @@ static void xhci_pci_quirks(struct device *dev, struct xhci_hcd *xhci)
- 	if (xhci->hci_version >= 0x120)
- 		xhci->quirks |= XHCI_DEFAULT_PM_RUNTIME_ALLOW;
- 
-+	/* Special case for PS5 Salina PHY */
-+	if (pdev->vendor == PCI_VENDOR_ID_SONY &&
-+	    pdev->device == PCI_DEVICE_ID_PS5_SALINA_XHCI) {
-+		xhci_dbg_trace(xhci, trace_xhci_dbg_init, "%s detected Salina USB PHY setting quirk", __func__);
-+		xhci->quirks |= XHCI_PS5_SALINA_PHY;
-+	    xhci->quirks |= XHCI_BROKEN_STREAMS;
-+	    xhci->quirks |= XHCI_DISABLE_SPARSE;
-+	    xhci->quirks |= XHCI_RESET_ON_RESUME;
-+		xhci->quirks |= XHCI_WRITE_64_HI_LO;
-+		pdev->dev_flags |= PCI_DEV_FLAGS_NO_D3;
-+	}
-+
- 	if (xhci->quirks & XHCI_RESET_ON_RESUME)
- 		xhci_dbg_trace(xhci, trace_xhci_dbg_quirks,
- 				"QUIRK: Resetting on resume");
-@@ -575,6 +592,16 @@ static int xhci_pci_setup(struct usb_hcd *hcd)
- 	/* imod_interval is the interrupt moderation value in nanoseconds. */
- 	xhci->imod_interval = 40000;
- 
-+	printk("%s enter", __func__);
-+
-+    /* Special case for PS5 Salina PHY */
-+    // Should be a good place to init, we dont have quirks here
-+    if (pdev->vendor == PCI_VENDOR_ID_SONY &&
-+        pdev->device == PCI_DEVICE_ID_PS5_SALINA_XHCI) {
-+        printk("%s detected Salina USB PHY, call custom init", __func__);
-+        xhci_salina_init(pdev);
-+    }
-+
- 	retval = xhci_gen_setup(hcd, xhci_pci_quirks);
- 	if (retval)
- 		return retval;
 diff --git a/drivers/usb/host/xhci-ps5.c b/drivers/usb/host/xhci-ps5.c
 new file mode 100644
-index 000000000000..7bbf4ab3e0a8
+index 000000000..7f10475e0
 --- /dev/null
 +++ b/drivers/usb/host/xhci-ps5.c
-@@ -0,0 +1,499 @@
+@@ -0,0 +1,612 @@
 +// Special code to apply quirks for the Salina xhci
 +#include <linux/pci.h>
 +#include <linux/io.h>
 +#include <linux/usb.h>
 +#include <linux/usb/hcd.h>
++#include <linux/workqueue.h>
 +#include <asm/delay.h>
 +#include "xhci-ps5.h"
 +#include "xhci.h"
 +#include "xhci-trace.h"
++#include "xhci-ring.h" // Get Event Handler method
 +
 +#define PCI_VENDOR_ID_SONY						0x104d
 +#define PCI_DEVICE_ID_PS5_SALINA_GLUE			0x9107
@@ -308,6 +35,15 @@ index 000000000000..7bbf4ab3e0a8
 +// Used on another function
 +u32 salina_revision;
 +
++
++#define SALINA_POLL_INTERVAL_MS   100
++struct salina_xhci_poller {
++    struct xhci_hcd *xhci;
++    struct delayed_work work;
++    u32 last_usbsts;
++};
++static struct salina_xhci_poller salina_poll;
++
 +void __iomem * map_bar(resource_size_t phys_addr, unsigned long size) {
 +    void __iomem *ptr = ioremap(phys_addr, size);
 +    if (!ptr) {
@@ -315,7 +51,6 @@ index 000000000000..7bbf4ab3e0a8
 +        release_mem_region(phys_addr, size);
 +        return 0;
 +    }
-+    printk("Mapped BAR %016llx with handler %p\n", phys_addr, ptr);
 +    return ptr;
 +}
 +
@@ -327,7 +62,6 @@ index 000000000000..7bbf4ab3e0a8
 +
 +    resource_size_t phys_addr = pci_resource_start(remote_pdev, 2); //BAR 2
 +    resource_size_t bar_len   = pci_resource_len(remote_pdev, 2);
-+	printk("What i get from Salina Glue BAR2 PA %016llx LEN %016llx\n", phys_addr, bar_len);
 +    if (phys_addr == 0) {
 +        pci_dev_put(remote_pdev);
 +        return -EINVAL;
@@ -337,7 +71,6 @@ index 000000000000..7bbf4ab3e0a8
 +
 +    phys_addr = pci_resource_start(remote_pdev, 4); //BAR 4
 +    bar_len   = pci_resource_len(remote_pdev, 4);
-+	printk("What i get from Salina Glue BAR4 PA %016llx LEN %016llx\n", phys_addr, bar_len);
 +    if (phys_addr == 0) {
 +        pci_dev_put(remote_pdev);
 +        return -EINVAL;
@@ -348,7 +81,6 @@ index 000000000000..7bbf4ab3e0a8
 +
 +    phys_addr = pci_resource_start(own_pdev, 0); //BAR0
 +    bar_len   = pci_resource_len(own_pdev, 1);
-+    printk("What i get from Own BAR0 PA %016llx LEN %016llx\n", phys_addr, bar_len);
 +	if (phys_addr == 0) {
 +        pci_dev_put(remote_pdev);
 +        return -EINVAL;
@@ -378,7 +110,6 @@ index 000000000000..7bbf4ab3e0a8
 +        return 0;
 +    }
 +    u32 val = readl(ptr);
-+    printk("Read from phys %016llx : %08x\n", addr, val);
 +    iounmap(ptr);
 +    return val;
 +}
@@ -389,73 +120,52 @@ index 000000000000..7bbf4ab3e0a8
 +
 +u32 salina_glue_bar2_read(u32 addr) {
 +    u32 val32 = readl(bar_salina_glue_2 + addr);
-+    printk("salina_glue_usb_phy_bar2_reg_read from addr %016x : %08x\n", addr, val32);
 +    return val32;
 +}
 +
 +void salina_glue_bar2_write(u32 addr, u32 val) {
-+    if (!bar_salina_glue_2) return; 
-+    printk("salina_glue_usb_phy_bar2_reg_write to addr %08x : %08x\n", addr, val);
++    if (!bar_salina_glue_2) return;
 +    writel(val, bar_salina_glue_2 + addr);
-+    u32 val32 = readl(bar_salina_glue_2 + addr);
-+    printk("salina_glue_usb_phy_bar2_reg_write from addr %08x : %08x\n", addr, val32);
 +}
 +
 +u32 salina_glue_usb_phy_bar2_reg_read(u32 reg) {
 +    u32 val32 = readl(bar_salina_glue_2 + 0x180000 + reg);
-+    printk("salina_glue_usb_phy_bar2_reg_read from reg %08x : %08x\n", reg, val32);
 +    return val32;
 +}
 +
 +void salina_glue_usb_phy_bar2_reg_write(u32 reg, u32 val) {
 +    if (!bar_salina_glue_2) return; 
-+    printk("salina_glue_usb_phy_bar2_reg_write to reg %08x : %08x\n", reg, val);
 +    writel(val, bar_salina_glue_2 + 0x180000 + reg);
-+    u32 val32 = readl(bar_salina_glue_2 + 0x180000 + reg);
-+    printk("salina_glue_usb_phy_bar2_reg_write from reg %08x : %08x\n", reg, val32);
 +}
 +
 +u32 salina_glue_bar3_read(u32 addr) {
 +    u32 val32 = readl(bar_salina_glue_3 + addr);
-+    printk("salina_glue_bar3_reg from addr %08x : %08x\n", addr, val32);
 +    return val32;
 +}
 +
 +void salina_glue_bar3_write(u32 addr, u32 val) {
 +    if (!bar_salina_glue_3) return;
-+    printk("salina_glue_bar3_write to reg %08x : %08x\n", addr, val);
 +    writel(val, bar_salina_glue_3 + addr);
-+    u32 val32 = readl(bar_salina_glue_3 + addr);
-+    printk("salina_glue_bar3_write from reg %08x : %08x\n", addr, val32);
 +}
 +
 +u32 salina_glue_usb_phy_bar3_reg_read(u32 reg) {
 +    u32 val32 = readl(bar_salina_glue_3 + 0x4000 + reg);
-+    printk("salina_glue_usb_phy_bar3_reg_read from reg %08x : %08x\n", reg, val32);
 +    return val32;
 +}
 +
 +void salina_glue_usb_phy_bar3_reg_write(u32 reg, u32 val) {
 +    if (!bar_salina_glue_3) return;
-+    printk("salina_glue_usb_phy_bar3_reg_write to reg %08x : %08x\n", reg, val);
 +    writel(val, bar_salina_glue_3 + 0x4000 + reg);
-+    u32 val32 = readl(bar_salina_glue_3 + 0x4000 + reg);
-+    printk("salina_glue_usb_phy_bar3_reg_write from reg %08x : %08x\n", reg, val32);
 +}
 +
 +u32 salina_xhci_bar_reg_read(u64 offset, u32 reg) {
-+    printk("salina_xhci_bar_reg_read offset: %016llx reg: %08x\n", offset, reg);
 +    u32 val32 = readl(bar_salina_xhci + offset + reg);
-+    printk("Read value: %08x\n", val32);
 +    return val32;
 +}
 +
 +void salina_xhci_bar_reg_write(u64 offset, u32 reg, u32 val) {
 +    if (!bar_salina_xhci) return; 
-+    printk("salina_xhci_bar_reg_write offset: %016llx reg: %08x val: %08x\n", offset, reg, val);
 +    writel(val, bar_salina_xhci + offset + reg);
-+    u32 val32 = readl(bar_salina_xhci + offset + reg);
-+    printk("salina_xhci_bar_reg_write from reg %08x : %08x\n", reg, val32);
 +}
 +
 +int salina_usb_phy_config_step_1(u8 usb_n) {
@@ -689,28 +399,6 @@ index 000000000000..7bbf4ab3e0a8
 +
 +    salina_usb_phy_config_step_4();
 +
-+	#define OPER_BAR 0x20
-+
-+	u32 usbcmd  = salina_xhci_bar_reg_read(OPER_BAR, 0x00);
-+	u32 usbsts  = salina_xhci_bar_reg_read(OPER_BAR, 0x04);
-+	u32 dnctrl  = salina_xhci_bar_reg_read(OPER_BAR, 0x14);
-+	u32 config  = salina_xhci_bar_reg_read(OPER_BAR, 0x38);
-+	u32 crcr_lo = salina_xhci_bar_reg_read(OPER_BAR, 0x18);
-+	u32 crcr_hi = salina_xhci_bar_reg_read(OPER_BAR, 0x1c);
-+
-+	printk("USBCMD=%08x USBSTS=%08x DNCTRL=%08x CONFIG=%08x CRCR=%08x%08x\n",
-+	       usbcmd, usbsts, dnctrl, config, crcr_hi, crcr_lo);
-+
-+
-+    u32 c100 = salina_xhci_bar_reg_read(0x0, 0xc100);
-+    u32 c12c = salina_xhci_bar_reg_read(0x0, 0xc12c);
-+    u32 c200 = salina_xhci_bar_reg_read(0x0, 0xc200);
-+    u32 c204 = salina_xhci_bar_reg_read(0x0, 0xc204);
-+    u32 c208 = salina_xhci_bar_reg_read(0x0, 0xc208);
-+
-+    printk("SALINA PWR: c100=%08x c12c=%08x c200=%08x c204=%08x c208=%08x\n",
-+           c100, c12c, c200, c204, c208);
-+
 +    // Reset software state
 +    xhci->usb2_rhub.bus_state.port_c_suspend = 0;
 +	xhci->usb2_rhub.bus_state.suspended_ports = 0;
@@ -778,12 +466,162 @@ index 000000000000..7bbf4ab3e0a8
 +{
 +    unmap_bars();
 +}
++
++int xhci_salina_cmd_ring_recover(struct xhci_hcd *xhci)
++{
++    u64 crcr = xhci_read_64(xhci, &xhci->op_regs->cmd_ring);
++
++    if (!(crcr & CMD_RING_RUNNING))
++        return 0;
++
++    xhci_warn(xhci, "Salina: command ring running, recovering\n");
++
++    /* 1) Request stop */
++    xhci_write_64(xhci, crcr | CMD_RING_ABORT, &xhci->op_regs->cmd_ring);
++    udelay(1000); /* or a bounded poll */
++
++    /* 2) Reprogram CRCR to our ring base with RCS only */
++    dma_addr_t base = xhci->cmd_ring->first_seg->dma;
++    u64 restart = (u64)base | (xhci->cmd_ring->cycle_state ? CMD_RING_CYCLE : 0);
++    xhci_write_64(xhci, restart, &xhci->op_regs->cmd_ring);
++
++    /* 3) Ring command doorbell */
++    xhci_ring_cmd_db(xhci);
++
++    return 0;
++}
++
++static void salina_xhci_poll_fn(struct work_struct *w)
++{
++    struct salina_xhci_poller *p =
++        container_of(w, struct salina_xhci_poller, work.work);
++    struct xhci_hcd *xhci = p->xhci;
++    struct xhci_ring *er = xhci->interrupters[0]->event_ring;
++	unsigned long flags;
++
++    if (!er)
++        goto resched;
++
++    // Try to get the lock like xhci_irq does. If it's busy, bail out immediately and retry later.
++    if (!spin_trylock_irqsave(&xhci->lock, flags)) {
++        printk(KERN_INFO "Salina poller: lock busy, rescheduling\n");
++        goto resched;
++    }
++
++    u32 status = readl(&xhci->op_regs->status);
++    if (status == ~(u32)0) {
++        xhci_hc_died(xhci);
++        goto unlock;
++    }
++
++    if (status & STS_HCE) {
++        xhci_warn(xhci, "WARNING: Host Controller Error\n");
++        xhci_halt(xhci);
++        goto unlock;
++    }
++
++    if (status & STS_FATAL) {
++        xhci_warn(xhci, "WARNING: Host System Error\n");
++        xhci_halt(xhci);
++        goto unlock;
++    }
++
++    {
++        struct xhci_segment *seg = er->deq_seg;
++        u32 idx = er->dequeue - er->deq_seg->trbs;
++        u8 ccs = er->cycle_state;
++        bool have_events = false;
++
++        if (seg) {
++            u32 field3 = seg->trbs[idx].generic.field[3];
++            u8 trb_cycle = field3 & 0x1;
++
++            if (trb_cycle == ccs)
++                have_events = true;
++        }
++
++        if (have_events) {
++            u32 *trb_raw = (u32 *)&seg->trbs[idx];
++            printk(KERN_INFO "Processing Event TRB [%03d] Virt: %p | RAW: %08x %08x %08x %08x\n",
++                idx, &seg->trbs[idx],
++                trb_raw[0], trb_raw[1], trb_raw[2], trb_raw[3]);
++            xhci_handle_events(xhci, xhci->interrupters[0], false);
++        }
++    }
++
++unlock:
++    spin_unlock_irqrestore(&xhci->lock, flags);
++
++resched:
++    schedule_delayed_work(&p->work,
++        msecs_to_jiffies(SALINA_POLL_INTERVAL_MS));
++}
++
++void salina_start_xhci_poller(struct xhci_hcd *xhci)
++{
++    memset(&salina_poll, 0, sizeof(salina_poll));
++    salina_poll.xhci = xhci;
++
++    INIT_DELAYED_WORK(&salina_poll.work, salina_xhci_poll_fn);
++
++    schedule_delayed_work(&salina_poll.work,
++                  msecs_to_jiffies(SALINA_POLL_INTERVAL_MS));
++
++    xhci_info(xhci, "Salina: software IRQ poller enabled\n");
++}
++
++void salina_stop_xhci_poller(void)
++{
++    cancel_delayed_work_sync(&salina_poll.work);
++}
++
++// Helpers
++static void xhci_dump_trb(const char *tag, struct xhci_generic_trb *trb)
++{
++    u32 lo = le32_to_cpu(trb->field[0]);
++    u32 hi = le32_to_cpu(trb->field[1]);
++    u32 sts = le32_to_cpu(trb->field[2]);
++    u32 flg = le32_to_cpu(trb->field[3]);
++
++    printk("%s: %08x %08x %08x %08x\n", tag, lo, hi, sts, flg);
++}
++
++static void xhci_salina_dump_ring(const char *name, struct xhci_ring *ring)
++{
++    int i;
++    struct xhci_segment *seg;
++    struct xhci_generic_trb *trb;
++
++    if (!ring) {
++        printk("Salina: %s ring NULL\n", name);
++        return;
++    }
++
++    printk("Salina: dumping %s ring: ring=%p, dequeue=%p, cycle=%d\n",
++        name, ring, ring->dequeue, ring->cycle_state);
++
++    seg = ring->first_seg;
++    for (i = 0; i < TRBS_PER_SEGMENT; i++) {
++        trb = (struct xhci_generic_trb*) &seg->trbs[i];
++        xhci_dump_trb(name, trb);
++    }
++}
++
++void xhci_salina_dump_state(struct xhci_hcd *xhci, struct xhci_interrupter *ir)
++{
++    struct xhci_ring *cmd = xhci->cmd_ring;
++
++    printk("Salina: dumping xHCI state (cmd + event rings)\n");
++
++    xhci_salina_dump_ring("CMD", cmd);
++    xhci_salina_dump_ring("EVT", ir->event_ring);
++}
 diff --git a/drivers/usb/host/xhci-ps5.h b/drivers/usb/host/xhci-ps5.h
 new file mode 100644
-index 000000000000..0bb810f28ee1
+index 000000000..764cc1552
 --- /dev/null
 +++ b/drivers/usb/host/xhci-ps5.h
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,47 @@
 +// Special code to apply quirks for the Salina xhci
 +#include <linux/pci.h>
 +#include <linux/io.h>
@@ -825,277 +663,132 @@ index 000000000000..0bb810f28ee1
 +int xhci_salina_reset(struct xhci_hcd *xhci, u64 timeout_us);
 +int xhci_salina_init(struct pci_dev *pdev);
 +void xhci_salina_exit(void);
++int xhci_salina_cmd_ring_recover(struct xhci_hcd *xhci);
++
++void salina_start_xhci_poller(struct xhci_hcd *xhci);
++void salina_stop_xhci_poller(void);
++
++void xhci_salina_dump_state(struct xhci_hcd *xhci, struct xhci_interrupter *ir);
+\ No newline at end of file
 diff --git a/drivers/usb/host/xhci-ring.c b/drivers/usb/host/xhci-ring.c
-index 1cbefee3c4ca..a1cb1675f461 100644
+index 1cbefee3c..aced3384f 100644
 --- a/drivers/usb/host/xhci-ring.c
 +++ b/drivers/usb/host/xhci-ring.c
 @@ -59,6 +59,8 @@
  #include <linux/dma-mapping.h>
  #include "xhci.h"
  #include "xhci-trace.h"
-+#include <linux/kernel.h>
-+
++#include "xhci-ring.h"
++#include "xhci-ps5.h"
  
  static int queue_command(struct xhci_hcd *xhci, struct xhci_command *cmd,
  			 u32 field1, u32 field2,
-@@ -426,9 +428,33 @@ void xhci_ring_cmd_db(struct xhci_hcd *xhci)
+@@ -3083,12 +3085,14 @@ static void xhci_clear_interrupt_pending(struct xhci_interrupter *ir)
+  * Handle all OS-owned events on an interrupter event ring. It may drop
+  * and reaquire xhci->lock between event processing.
+  */
+-static int xhci_handle_events(struct xhci_hcd *xhci, struct xhci_interrupter *ir,
++int xhci_handle_events(struct xhci_hcd *xhci, struct xhci_interrupter *ir,
+ 			      bool skip_events)
+ {
+ 	int event_loop = 0;
+ 	int err = 0;
+ 	u64 temp;
++	int iters = 0;
++	const int max_iters = 32; // To avoid stuck on while for Salina
  
- 	xhci_dbg(xhci, "// Ding dong!\n");
+ 	xhci_clear_interrupt_pending(ir);
  
--	trace_xhci_ring_host_doorbell(0, DB_VALUE_HOST);
-+	if (xhci->quirks & XHCI_PS5_SALINA_PHY) {
-+	/******************** SALINA **********************/
-+	// In 7.x, xhci->dba points directly to the __le32 doorbell array base
-+    void __iomem *db_addr = &xhci->dba[0];
-+
-+
-+    	dev_info(xhci_to_hcd(xhci)->self.sysdev,
-+             "=== SALINA DOORBELL TRACE ===\n");
-+    	dev_info(xhci_to_hcd(xhci)->self.sysdev,
-+             "Ringing Command DB! Virtual Addr: %px, Physical Offset: 0x%lx\n",
-+             db_addr, (unsigned long)((u8 __iomem *)db_addr - (u8 __iomem *)xhci->cap_regs));
-+	/******************** SALINA *********************/
-+
-+		trace_xhci_ring_host_doorbell(0, DB_VALUE_HOST);
-+
-+		printk("op_regs.command before DB0 write: %08x\n", readl(&xhci->op_regs->command));
-+		printk("op_regs.status before DB0 write: %08x\n", readl(&xhci->op_regs->status));
-+		printk("Before DB0 write: DB0=%08x\n", readl(&xhci->dba->doorbell[0]));
-+	}
+@@ -3110,6 +3114,8 @@ static int xhci_handle_events(struct xhci_hcd *xhci, struct xhci_interrupter *ir
  
- 	writel(DB_VALUE_HOST, &xhci->dba->doorbell[0]);
-+
-+	if (xhci->quirks & XHCI_PS5_SALINA_PHY) {
-+		printk("After  DB0 write: DB0=%08x\n", readl(&xhci->dba->doorbell[0]));
-+    	printk("op_regs.command after DB0 write: %08x\n", readl(&xhci->op_regs->command));
-+    	printk("op_regs.status after DB0 write: %08x\n", readl(&xhci->op_regs->status));
-+	}
- 	/* Flush PCI posted writes */
- 	readl(&xhci->dba->doorbell[0]);
- }
-@@ -1725,6 +1751,21 @@ void xhci_handle_command_timeout(struct work_struct *work)
+ 	/* Process all OS owned event TRBs on this event ring */
+ 	while (unhandled_event_trb(ir->event_ring)) {
++		if (xhci->quirks & XHCI_PS5_SALINA_PHY)
++			printk(KERN_INFO "Running xhci_handle_events iteration %03d\n", iters);
+ 		if (!skip_events)
+ 			err = xhci_handle_event_trb(xhci, ir, ir->event_ring->dequeue);
  
- 	xhci = container_of(to_delayed_work(work), struct xhci_hcd, cmd_timer);
+@@ -3131,11 +3137,31 @@ static int xhci_handle_events(struct xhci_hcd *xhci, struct xhci_interrupter *ir
  
-+/******************** SALINA **********************/
-+	u64 crcr;
+ 		if (err)
+ 			break;
 +
-+    // Read the current hardware Command Ring Control Register (64-bit)
-+    crcr = xhci_read_64(xhci, &xhci->op_regs->cmd_ring);
-+
-+    dev_info(xhci_to_hcd(xhci)->self.sysdev,
-+             "=== SALINA TIMEOUT TRACE ===\n");
-+    dev_info(xhci_to_hcd(xhci)->self.sysdev,
-+             "Original Ring Address: 0x%llx\n", (unsigned long long)xhci->cmd_ring->first_seg->dma);
-+    dev_info(xhci_to_hcd(xhci)->self.sysdev,
-+             "Current HW CRCR Pointer: 0x%llx (CRR bit: %llu)\n",
-+             (unsigned long long)(crcr & ~0x3F), crcr & CMD_RING_RUNNING);
-+/******************** SALINA ********************/
-+
- 	spin_lock_irqsave(&xhci->lock, flags);
- 
- 	/*
-@@ -1740,6 +1781,53 @@ void xhci_handle_command_timeout(struct work_struct *work)
- 	usbsts = readl(&xhci->op_regs->status);
- 	xhci_dbg(xhci, "Command timeout, USBSTS:%s\n", xhci_decode_usbsts(str, usbsts));
- 
-+	struct xhci_ring *cmd_ring;
-+	struct xhci_ring *event_ring;
-+	struct xhci_segment *seg;
-+	int i;
-+	u32 *trb_raw;
-+
-+/* --- INICIO DEL VOLCADO DE MEMORIA REAL --- */
-+	pr_err("=== xHCI RAW MEMORY DUMP (COMMAND RING) ===\n");
-+	cmd_ring = xhci->cmd_ring;
-+	if (cmd_ring && cmd_ring->first_seg) {
-+		seg = cmd_ring->first_seg;
-+		do {
-+			pr_err("Segment DMA Address: 0x%llx, Virt: %p\n",
-+			       (unsigned long long)seg->dma, seg->trbs);
-+
-+			for (i = 0; i < TRBS_PER_SEGMENT; i++) {
-+				trb_raw = (u32 *)&seg->trbs[i];
-+				pr_err("  TRB [%03d] Virt: %p | RAW: %08x %08x %08x %08x\n",
-+				       i, &seg->trbs[i],
-+				       trb_raw[0], trb_raw[1], trb_raw[2], trb_raw[3]);
-+			}
-+			seg = seg->next;
-+		} while (seg && seg != cmd_ring->first_seg);
-+	}
-+
-+	pr_err("=== xHCI RAW MEMORY DUMP (EVENT RING) ===\n");
-+	/* Validación compatible tanto con arreglos de interrupters como con punteros */
-+	if (xhci->interrupters && xhci->interrupters[0]) {
-+		event_ring = xhci->interrupters[0]->event_ring;
-+		if (event_ring && event_ring->first_seg) {
-+			seg = event_ring->first_seg;
-+			do {
-+				pr_err("Segment DMA Address: 0x%llx, Virt: %p\n",
-+				       (unsigned long long)seg->dma, seg->trbs);
-+
-+				for (i = 0; i < TRBS_PER_SEGMENT; i++) {
-+					trb_raw = (u32 *)&seg->trbs[i];
-+					pr_err("  TRB [%03d] Virt: %p | RAW: %08x %08x %08x %08x\n",
-+					       i, &seg->trbs[i],
-+					       trb_raw[0], trb_raw[1], trb_raw[2], trb_raw[3]);
-+				}
-+				seg = seg->next;
-+			} while (seg && seg != event_ring->first_seg);
++		if (xhci->quirks & XHCI_PS5_SALINA_PHY) {
++			if (++iters > max_iters) {
++	            xhci_warn(xhci,
++	                  "Salina: event ring appears stuck after %d TRBs, dumping rings\n",
++	                  iters);
++	            goto salina_stuck;
++	        }
 +		}
-+	}
-+	pr_err("=== END OF RAW MEMORY DUMP ===\n");
-+
- 	/* Bail out and tear down xhci if a stop endpoint command failed */
- 	if (TRB_FIELD_TO_TYPE(cmd_field3) == TRB_STOP_RING) {
- 		struct xhci_virt_ep	*ep;
-@@ -3180,6 +3268,28 @@ irqreturn_t xhci_irq(struct usb_hcd *hcd)
- 	irqreturn_t ret = IRQ_HANDLED;
- 	u32 status;
+ 	}
  
-+/**************************** SALINA ***********************/
-+    u32 iman;
-+    u64 erdp;
-+void __iomem *ir_set_base;
+ 	xhci_update_erst_dequeue(xhci, ir, true);
+-
++	if (xhci->quirks & XHCI_PS5_SALINA_PHY)
++		printk(KERN_INFO "Returning from xhci_handle_events\n");
+ 	return 0;
 +
-+    // Get the base address of the primary interrupter set (Interrupter 0)
-+    ir_set_base = &xhci->run_regs->ir_set[0];
++salina_stuck:
++    /* mark host dying so we don't deadlock future URBs */
++    xhci->xhc_state |= XHCI_STATE_DYING;
 +
-+    // Read IMAN (always sits at offset 0x00 of the interrupter bank)
-+    iman = readl(ir_set_base + 0x00); 
++    /* dump rings for debugging */
++    xhci_salina_dump_state(xhci, ir);
 +
-+    // Read ERDP (always sits at offset 0x10 of the interrupter bank)
-+    // We cast to an explicit void pointer to satisfy xhci_read_64's validation
-+    erdp = xhci_read_64(xhci, (void __iomem *)(ir_set_base + 0x10)); 
++    xhci_update_erst_dequeue(xhci, ir, true);
++    return -EIO;
+ }
+ 
+ /*
+diff --git a/drivers/usb/host/xhci-ring.h b/drivers/usb/host/xhci-ring.h
+new file mode 100644
+index 000000000..193ac03a3
+--- /dev/null
++++ b/drivers/usb/host/xhci-ring.h
+@@ -0,0 +1,4 @@
++#include "xhci.h"
 +
-+    trace_printk("SALINA IRQ: Hit! IMAN raw: 0x%08x (IP=%d, IE=%d)\n", 
-+                 iman, !!(iman & 0x1), !!(iman & 0x2));
-+    trace_printk("SALINA IRQ: ERDP raw: 0x%llx (EHB=%llu)\n", 
-+                 erdp, erdp & 0x8);
-+/****************************** SALINA ************************/
-+
-+
- 	spin_lock(&xhci->lock);
- 	/* Check if the xHC generated the interrupt, or the irq is shared */
- 	status = readl(&xhci->op_regs->status);
++dma_addr_t xhci_trb_virt_to_dma(struct xhci_segment *seg, union xhci_trb *trb);
++int xhci_handle_events(struct xhci_hcd *xhci, struct xhci_interrupter *ir, bool skip_events);
 diff --git a/drivers/usb/host/xhci.c b/drivers/usb/host/xhci.c
-index 8d8f0865fc12..f38e2dbe84c0 100644
+index 8d8f0865f..b34b64f90 100644
 --- a/drivers/usb/host/xhci.c
 +++ b/drivers/usb/host/xhci.c
-@@ -27,6 +27,8 @@
+@@ -26,6 +26,7 @@
+ #include "xhci-trace.h"
  #include "xhci-debugfs.h"
  #include "xhci-dbgcap.h"
- 
 +#include "xhci-ps5.h"
-+
+ 
  #define DRIVER_AUTHOR "Sarah Sharp"
  #define DRIVER_DESC "'eXtensible' Host Controller (xHC) Driver"
- 
-@@ -153,8 +155,13 @@ int xhci_start(struct xhci_hcd *xhci)
- 	u32 temp;
- 	int ret;
- 
-+	// // Defer to own implementation
-+	// if(xhci->quirks & XHCI_PS5_SALINA_PHY)
-+	// 	return xhci_salina_init(xhci);
-+
- 	temp = readl(&xhci->op_regs->command);
--	temp |= (CMD_RUN);
-+	/* Salina needs 0xD (RS | HSEE | LHCR) instead of just CMD_RUN (0x1) */
-+	temp |= (CMD_RUN | CMD_EIE | CMD_HSEIE);
- 	xhci_dbg_trace(xhci, trace_xhci_dbg_init, "// Turn on HC, cmd = 0x%x.",
- 			temp);
- 	writel(temp, &xhci->op_regs->command);
-@@ -191,6 +198,10 @@ int xhci_reset(struct xhci_hcd *xhci, u64 timeout_us)
+@@ -191,6 +192,11 @@ int xhci_reset(struct xhci_hcd *xhci, u64 timeout_us)
  	u32 state;
  	int ret;
  
-+	// Defer to own implementation
-+	if (xhci->quirks & XHCI_PS5_SALINA_PHY)
++	// On Salina defer to our implementation
++	if (xhci->quirks & XHCI_PS5_SALINA_PHY) {
 +		return xhci_salina_reset(xhci, 5000);
++	}
 +
  	state = readl(&xhci->op_regs->status);
  
  	if (state == ~(u32)0) {
-@@ -1034,7 +1045,7 @@ int xhci_suspend(struct xhci_hcd *xhci, bool do_wakeup)
- 	writel(command, &xhci->op_regs->command);
- 	xhci->broken_suspend = 0;
- 	if (xhci_handshake(&xhci->op_regs->status,
--				STS_SAVE, 0, 20 * 1000)) {
-+				STS_SAVE, 0, 5000 * 1000)) {
- 	/*
- 	 * AMD SNPS xHC 3.0 occasionally does not clear the
- 	 * SSS bit of USBSTS and when driver tries to poll
-@@ -1136,7 +1147,7 @@ int xhci_resume(struct xhci_hcd *xhci, bool power_lost, bool is_auto_resume)
- 		 * doesn't mention any timeout value.
- 		 */
- 		if (xhci_handshake(&xhci->op_regs->status,
--			      STS_RESTORE, 0, 100 * 1000)) {
-+			      STS_RESTORE, 0, 5000 * 1000)) {
- 			xhci_warn(xhci, "WARN: xHC restore state timeout\n");
- 			spin_unlock_irq(&xhci->lock);
- 			return -ETIMEDOUT;
-@@ -1223,10 +1234,11 @@ int xhci_resume(struct xhci_hcd *xhci, bool power_lost, bool is_auto_resume)
+@@ -625,6 +631,11 @@ static int xhci_run_finished(struct xhci_hcd *xhci)
  
- 	/* step 4: set Run/Stop bit */
- 	command = readl(&xhci->op_regs->command);
--	command |= CMD_RUN;
-+	/* Salina needs 0xD (RS | HSEE | LHCR) instead of just CMD_RUN (0x1) */
-+	command |= (CMD_RUN | CMD_EIE | CMD_HSEIE); // Force 0xD
- 	writel(command, &xhci->op_regs->command);
- 	xhci_handshake(&xhci->op_regs->status, STS_HALT,
--		  0, 250 * 1000);
-+		  0, 5000 * 1000);
+ 	spin_unlock_irqrestore(&xhci->lock, flags);
  
- 	/* step 5: walk topology and initialize portsc,
- 	 * portpmsc and portli
-@@ -5484,7 +5496,7 @@ int xhci_gen_setup(struct usb_hcd *hcd, xhci_get_quirks_t get_quirks)
- 		return retval;
++	// Start "IRQ" poller for Salina
++	if(xhci->quirks & XHCI_PS5_SALINA_PHY) {
++		salina_start_xhci_poller(xhci);
++	}
++
+ 	return 0;
+ }
  
- 	xhci_zero_64b_regs(xhci);
--
-+	xhci_dbg_trace(xhci, trace_xhci_dbg_init, "%s xhci config values cap_regs: %016lx op_regs: %016lx run_regs: %016lx\n    ", __func__, xhci->cap_regs, xhci->op_regs, xhci->run_regs);
- 	xhci_dbg(xhci, "Resetting HCD\n");
- 	/* Reset the internal HC memory state and registers. */
- 	retval = xhci_reset(xhci, XHCI_RESET_LONG_USEC);
-@@ -5505,7 +5517,8 @@ int xhci_gen_setup(struct usb_hcd *hcd, xhci_get_quirks_t get_quirks)
- 	/* Set dma_mask and coherent_dma_mask to 64-bits,
- 	 * if xHC supports 64-bit addressing */
- 	if ((xhci->hcc_params & HCC_64BIT_ADDR) &&
--			!dma_set_mask(dev, DMA_BIT_MASK(64))) {
-+			!dma_set_mask(dev, DMA_BIT_MASK(64))
-+			&& !(xhci->quirks & XHCI_PS5_SALINA_PHY) ) {
- 		xhci_dbg(xhci, "Enabling 64-bit DMA addresses.\n");
- 		dma_set_coherent_mask(dev, DMA_BIT_MASK(64));
- 	} else {
-@@ -5513,11 +5526,20 @@ int xhci_gen_setup(struct usb_hcd *hcd, xhci_get_quirks_t get_quirks)
- 		 * This is to avoid error in cases where a 32-bit USB
- 		 * controller is used on a 64-bit capable system.
- 		 */
--		retval = dma_set_mask(dev, DMA_BIT_MASK(32));
--		if (retval)
--			return retval;
--		xhci_dbg(xhci, "Enabling 32-bit DMA addresses.\n");
--		dma_set_coherent_mask(dev, DMA_BIT_MASK(32));
-+		if (xhci->quirks & XHCI_PS5_SALINA_PHY) {
-+			retval = dma_set_mask(dev, DMA_BIT_MASK(31));
-+            if (retval)
-+                return retval;
-+            xhci_dbg(xhci, "Enabling 31-bit DMA addresses for SALINA.\n");
-+            dma_set_coherent_mask(dev, DMA_BIT_MASK(31));
-+		}
-+		else {
-+			retval = dma_set_mask(dev, DMA_BIT_MASK(32));
-+			if (retval)
-+				return retval;
-+			xhci_dbg(xhci, "Enabling 32-bit DMA addresses.\n");
-+			dma_set_coherent_mask(dev, DMA_BIT_MASK(32));
-+		}
- 	}
- 
- 	xhci_dbg(xhci, "Calling HCD init\n");
 diff --git a/drivers/usb/host/xhci.h b/drivers/usb/host/xhci.h
-index 2b0796f6d00e..d0893b635779 100644
+index 2b0796f6d..d0893b635 100644
 --- a/drivers/usb/host/xhci.h
 +++ b/drivers/usb/host/xhci.h
 @@ -1461,7 +1461,7 @@ struct xhci_interrupter {

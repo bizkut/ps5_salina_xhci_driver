@@ -1,348 +1,353 @@
 diff --git a/drivers/usb/host/xhci-ps5.c b/drivers/usb/host/xhci-ps5.c
 new file mode 100644
-index 000000000..7f10475e0
+index 000000000000..111111111111
 --- /dev/null
 +++ b/drivers/usb/host/xhci-ps5.c
-@@ -0,0 +1,612 @@
-+// Special code to apply quirks for the Salina xhci
-+#include <linux/pci.h>
+@@ -0,0 +1,525 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Sony PlayStation 5 Salina xHCI glue and PHY setup.
++ */
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/delay.h>
 +#include <linux/io.h>
++#include <linux/pci.h>
 +#include <linux/usb.h>
 +#include <linux/usb/hcd.h>
 +#include <linux/workqueue.h>
-+#include <asm/delay.h>
-+#include "xhci-ps5.h"
++
 +#include "xhci.h"
-+#include "xhci-trace.h"
-+#include "xhci-ring.h" // Get Event Handler method
++#include "xhci-ps5.h"
++#include "xhci-ring.h"
 +
-+#define PCI_VENDOR_ID_SONY						0x104d
-+#define PCI_DEVICE_ID_PS5_SALINA_GLUE			0x9107
-+#define PCI_DEVICE_ID_PS5_SALINA_XHCI			0x9108
++#define PCI_DEVICE_ID_PS5_SALINA_GLUE	0x9107
 +
-+#define SALINA_GLUE_BAR2        0x85200000
-+#define SALINA_GLUE_BAR2_SIZE   0x190000
-+#define SALINA_GLUE_BAR3        0x85400000
-+#define SALINA_GLUE_BAR3_SIZE   0x200000
++#define SALINA_GLUE_BAR2_PHY_BASE	0x180000
++#define SALINA_GLUE_BAR4_PHY_BASE	0x4000
++#define SALINA_XHCI_PHY0_BASE		0x120000
++#define SALINA_XHCI_PHY_STRIDE		0x4000
++#define SALINA_XHCI_CTRL_BASE		0x100000
++#define SALINA_USB_TRACE_LEN_PHYS	0x9bf44
 +
-+#define SALINA_XHCI_BAR        0x85600000
-+#define SALINA_XHCI_BAR_SIZE   0x140000
++#define SALINA_MIN_GLUE_BAR2_SIZE	0x180028
++#define SALINA_MIN_GLUE_BAR4_SIZE	0x4070
++#define SALINA_MIN_XHCI_BAR_SIZE		0x129000
++#define SALINA_POLL_INTERVAL_MS		100
 +
-+void __iomem * bar_salina_glue_2;
-+void __iomem * bar_salina_glue_3;
-+void __iomem * bar_salina_xhci;
-+
-+// Used on another function
-+u32 salina_revision;
-+
-+
-+#define SALINA_POLL_INTERVAL_MS   100
-+struct salina_xhci_poller {
-+    struct xhci_hcd *xhci;
-+    struct delayed_work work;
-+    u32 last_usbsts;
++struct salina_xhci_state {
++	struct pci_dev *glue;
++	void __iomem *glue_bar2;
++	void __iomem *glue_bar4;
++	void __iomem *xhci_bar;
 +};
++
++struct salina_xhci_poller {
++	struct xhci_hcd *xhci;
++	struct delayed_work work;
++	bool running;
++};
++
++static struct salina_xhci_state salina;
 +static struct salina_xhci_poller salina_poll;
 +
-+void __iomem * map_bar(resource_size_t phys_addr, unsigned long size) {
-+    void __iomem *ptr = ioremap(phys_addr, size);
-+    if (!ptr) {
-+        pr_err("Could not ioremap memory\n");
-+        release_mem_region(phys_addr, size);
-+        return 0;
-+    }
-+    return ptr;
++static int salina_ioremap_bar(struct pci_dev *pdev, int bar,
++				      resource_size_t min_size, void __iomem **base)
++{
++	resource_size_t start = pci_resource_start(pdev, bar);
++	resource_size_t len = pci_resource_len(pdev, bar);
++
++	if (!(pci_resource_flags(pdev, bar) & IORESOURCE_MEM) || !start ||
++	    len < min_size)
++		return -ENODEV;
++
++	*base = ioremap(start, len);
++	return *base ? 0 : -ENOMEM;
 +}
 +
-+int init_bars(struct pci_dev *own_pdev) {
++static void salina_unmap_bars(void)
++{
++	if (salina.xhci_bar) {
++		iounmap(salina.xhci_bar);
++		salina.xhci_bar = NULL;
++	}
 +
-+    // We get the salina_glue BARs from PCIE device
-+    struct pci_dev *remote_pdev = pci_get_device(PCI_VENDOR_ID_SONY, PCI_DEVICE_ID_PS5_SALINA_GLUE, NULL);
-+    if (!remote_pdev) return -ENODEV;
++	if (salina.glue_bar4) {
++		iounmap(salina.glue_bar4);
++		salina.glue_bar4 = NULL;
++	}
 +
-+    resource_size_t phys_addr = pci_resource_start(remote_pdev, 2); //BAR 2
-+    resource_size_t bar_len   = pci_resource_len(remote_pdev, 2);
-+    if (phys_addr == 0) {
-+        pci_dev_put(remote_pdev);
-+        return -EINVAL;
-+    }
-+    bar_salina_glue_2 = map_bar(phys_addr, SALINA_GLUE_BAR2_SIZE);
-+    if (!bar_salina_glue_2) return -ENOMEM;
++	if (salina.glue_bar2) {
++		iounmap(salina.glue_bar2);
++		salina.glue_bar2 = NULL;
++	}
 +
-+    phys_addr = pci_resource_start(remote_pdev, 4); //BAR 4
-+    bar_len   = pci_resource_len(remote_pdev, 4);
-+    if (phys_addr == 0) {
-+        pci_dev_put(remote_pdev);
-+        return -EINVAL;
-+    }
-+    bar_salina_glue_3 = map_bar(phys_addr, SALINA_GLUE_BAR3_SIZE);
-+    if (!bar_salina_glue_3) goto err_glue2;
-+
-+
-+    phys_addr = pci_resource_start(own_pdev, 0); //BAR0
-+    bar_len   = pci_resource_len(own_pdev, 1);
-+	if (phys_addr == 0) {
-+        pci_dev_put(remote_pdev);
-+        return -EINVAL;
-+    }
-+    bar_salina_xhci = map_bar(phys_addr, SALINA_XHCI_BAR_SIZE);
-+    if (!bar_salina_xhci) goto err_glue3;
-+
-+    return 0;
-+
-+err_glue3:
-+    iounmap(bar_salina_glue_3);
-+err_glue2:
-+    iounmap(bar_salina_glue_2);
-+    return -ENOMEM;
++	if (salina.glue) {
++		pci_dev_put(salina.glue);
++		salina.glue = NULL;
++	}
 +}
 +
-+void unmap_bars(void) {
-+    iounmap(bar_salina_glue_2);
-+    iounmap(bar_salina_glue_3);
-+    iounmap(bar_salina_xhci);
++static int salina_map_bars(struct pci_dev *pdev)
++{
++	int ret;
++
++	salina.glue = pci_get_device(PCI_VENDOR_ID_SONY,
++					 PCI_DEVICE_ID_PS5_SALINA_GLUE, NULL);
++	if (!salina.glue)
++		return -ENODEV;
++
++	ret = salina_ioremap_bar(salina.glue, 2, SALINA_MIN_GLUE_BAR2_SIZE,
++				       &salina.glue_bar2);
++	if (ret)
++		goto err_unmap;
++
++	ret = salina_ioremap_bar(salina.glue, 4, SALINA_MIN_GLUE_BAR4_SIZE,
++				       &salina.glue_bar4);
++	if (ret)
++		goto err_unmap;
++
++	ret = salina_ioremap_bar(pdev, 0, SALINA_MIN_XHCI_BAR_SIZE,
++				       &salina.xhci_bar);
++	if (ret)
++		goto err_unmap;
++
++	return 0;
++
++err_unmap:
++	salina_unmap_bars();
++	return ret;
 +}
 +
-+u32 phys_readl(u64 addr) {
-+    void __iomem *ptr = ioremap(addr, 4);
-+    if (!ptr) {
-+        pr_err("Could not ioremap memory\n");
-+        return 0;
-+    }
-+    u32 val = readl(ptr);
-+    iounmap(ptr);
-+    return val;
++static u32 salina_phys_readl(phys_addr_t addr)
++{
++	void __iomem *ptr;
++	u32 val;
++
++	ptr = ioremap(addr, sizeof(u32));
++	if (!ptr)
++		return 0;
++
++	val = readl(ptr);
++	iounmap(ptr);
++	return val;
 +}
 +
-+u8 usb_get_length(u8 usb_n) {
-+    return (u8)((phys_readl(0x9bf44) >> (usb_n*8))&0x1f);
++static u8 salina_usb_trace_len(u8 port)
++{
++	return (salina_phys_readl(SALINA_USB_TRACE_LEN_PHYS) >> (port * 8)) & 0x1f;
 +}
 +
-+u32 salina_glue_bar2_read(u32 addr) {
-+    u32 val32 = readl(bar_salina_glue_2 + addr);
-+    return val32;
++static u32 salina_glue_phy_read(u32 reg)
++{
++	return readl(salina.glue_bar2 + SALINA_GLUE_BAR2_PHY_BASE + reg);
 +}
 +
-+void salina_glue_bar2_write(u32 addr, u32 val) {
-+    if (!bar_salina_glue_2) return;
-+    writel(val, bar_salina_glue_2 + addr);
++static void salina_glue_phy_write(u32 reg, u32 val)
++{
++	writel(val, salina.glue_bar2 + SALINA_GLUE_BAR2_PHY_BASE + reg);
 +}
 +
-+u32 salina_glue_usb_phy_bar2_reg_read(u32 reg) {
-+    u32 val32 = readl(bar_salina_glue_2 + 0x180000 + reg);
-+    return val32;
++static u32 salina_glue_pcs_read(u32 reg)
++{
++	return readl(salina.glue_bar4 + SALINA_GLUE_BAR4_PHY_BASE + reg);
 +}
 +
-+void salina_glue_usb_phy_bar2_reg_write(u32 reg, u32 val) {
-+    if (!bar_salina_glue_2) return; 
-+    writel(val, bar_salina_glue_2 + 0x180000 + reg);
++static u32 salina_xhci_read(u32 offset, u32 reg)
++{
++	return readl(salina.xhci_bar + offset + reg);
 +}
 +
-+u32 salina_glue_bar3_read(u32 addr) {
-+    u32 val32 = readl(bar_salina_glue_3 + addr);
-+    return val32;
++static void salina_xhci_write(u32 offset, u32 reg, u32 val)
++{
++	writel(val, salina.xhci_bar + offset + reg);
 +}
 +
-+void salina_glue_bar3_write(u32 addr, u32 val) {
-+    if (!bar_salina_glue_3) return;
-+    writel(val, bar_salina_glue_3 + addr);
++static int salina_usb_phy_base(u8 port, u32 *base)
++{
++	if (port > 2)
++		return -EINVAL;
++
++	*base = SALINA_XHCI_PHY0_BASE + port * SALINA_XHCI_PHY_STRIDE;
++	return 0;
 +}
 +
-+u32 salina_glue_usb_phy_bar3_reg_read(u32 reg) {
-+    u32 val32 = readl(bar_salina_glue_3 + 0x4000 + reg);
-+    return val32;
++static u8 salina_usb_trace_trim(u8 port, u8 trace_len)
++{
++	if (trace_len < 3)
++		return 8;
++	if (trace_len < 6)
++		return 7;
++	if (trace_len < 8)
++		return 6;
++	if (trace_len < 10)
++		return 5;
++	if (trace_len < 13)
++		return 4;
++
++	switch (port) {
++	case 0:
++		return 4;
++	case 1:
++		return 6;
++	case 2:
++		return 7;
++	default:
++		return 4;
++	}
 +}
 +
-+void salina_glue_usb_phy_bar3_reg_write(u32 reg, u32 val) {
-+    if (!bar_salina_glue_3) return;
-+    writel(val, bar_salina_glue_3 + 0x4000 + reg);
++static int salina_usb_phy_config_step_1(u8 port)
++{
++	u32 base;
++	u32 val;
++	u32 efuse;
++	u8 trace_len;
++	int ret;
++
++	ret = salina_usb_phy_base(port, &base);
++	if (ret)
++		return ret;
++
++	val = salina_glue_pcs_read(0x6c);
++	if (!((val >> 0x19) & (val >> 0x11) & 1))
++		efuse = 0x98;
++	else
++		efuse = (salina_glue_pcs_read(0x44) >> (port * 5 + 0x10)) & 0x1f;
++
++	salina_xhci_write(base, 0x800, 0x480a);
++	salina_xhci_write(base, 0x814, 0x10a01000);
++
++	val = salina_xhci_read(base, 0x818);
++	salina_xhci_write(base, 0x818, val & 0xff7fffff);
++
++	val = salina_xhci_read(base, 0x800);
++	salina_xhci_write(base, 0x800, val | 0x20);
++
++	val = salina_xhci_read(base, 0x868);
++	salina_xhci_write(base, 0x868, val & 0xfffbffff);
++
++	val = salina_xhci_read(base, 0x804);
++	salina_xhci_write(base, 0x804, (val & 0xff07ffff) | (efuse << 0x13));
++
++	trace_len = salina_usb_trace_len(port);
++	val = salina_xhci_read(base, 0x818);
++	salina_xhci_write(base, 0x818, (val & 0xffffff0f) | 0xa0);
++
++	val = salina_xhci_read(base, 0x818);
++	salina_xhci_write(base, 0x818,
++			   (val & 0xfffffff0) | salina_usb_trace_trim(port, trace_len));
++
++	return 0;
 +}
 +
-+u32 salina_xhci_bar_reg_read(u64 offset, u32 reg) {
-+    u32 val32 = readl(bar_salina_xhci + offset + reg);
-+    return val32;
++static int salina_usb_phy_config_step_2(u8 port)
++{
++	u32 base;
++	u32 calibration;
++	u32 measure = 0;
++	u32 val;
++	int attempts = 100;
++	int ret;
++
++	ret = salina_usb_phy_base(port, &base);
++	if (ret)
++		return ret;
++
++	val = salina_xhci_read(base, 0x814);
++	salina_xhci_write(base, 0x814, val | 0x8000);
++
++	usleep_range(1, 2);
++
++	val = salina_xhci_read(base, 0x110);
++	salina_xhci_write(base, 0x110, val | 0x100);
++
++	val = salina_xhci_read(base, 0x100);
++	salina_xhci_write(base, 0x100, (val & 0xff000000) | 0x400);
++
++	val = salina_xhci_read(base, 0x100);
++	salina_xhci_write(base, 0x100, val | 0x1000000);
++
++	do {
++		measure = salina_xhci_read(base, 0x10c);
++		if (measure)
++			break;
++		usleep_range(1, 2);
++	} while (--attempts);
++
++	val = salina_xhci_read(base, 0x100);
++	salina_xhci_write(base, 0x100, val & 0xfeffffff);
++
++	val = salina_xhci_read(base, 0x110);
++	salina_xhci_write(base, 0x110, val & 0xfffffeff);
++
++	if (!measure)
++		return -ETIMEDOUT;
++
++	calibration = (u32)((0xb9000 / (u64)measure) / 1000);
++
++	val = salina_xhci_read(base, 0x814);
++	salina_xhci_write(base, 0x814, (val & 0xffff8fff) | (calibration << 12));
++
++	val = salina_xhci_read(base, 0x814);
++	salina_xhci_write(base, 0x814, val & 0xffff7fff);
++
++	return 0;
 +}
 +
-+void salina_xhci_bar_reg_write(u64 offset, u32 reg, u32 val) {
-+    if (!bar_salina_xhci) return; 
-+    writel(val, bar_salina_xhci + offset + reg);
++static int salina_usb_phy_config_step_3(u8 port)
++{
++	u32 base;
++	u32 val;
++	int ret;
++
++	ret = salina_usb_phy_base(port, &base);
++	if (ret)
++		return ret;
++
++	val = salina_xhci_read(base, 0x800);
++	salina_xhci_write(base, 0x800, val | 0x1);
++
++	val = salina_xhci_read(base, 0x808);
++	salina_xhci_write(base, 0x808, val & 0xfffdffff);
++
++	val = salina_xhci_read(base, 0x880);
++	salina_xhci_write(base, 0x880, val | 0x1);
++
++	return 0;
 +}
 +
-+int salina_usb_phy_config_step_1(u8 usb_n) {
++static void salina_usb_phy_config_step_4(void)
++{
++	u32 val;
 +
-+    u64 bar_offset;
-+    u32 val32;
-+    u32 usb_efuse;
-+    u32 usb_length;
-+
-+    switch (usb_n) {
-+        case 0: bar_offset = 0x120000; break;
-+        case 1: bar_offset = 0x124000; break;
-+        case 2: bar_offset = 0x128000; break;
-+        default: bar_offset = 0x120000;
-+    }
-+
-+    val32 = salina_glue_usb_phy_bar3_reg_read(0x6c);
-+    if ((val32 >> 0x19 & val32 >> 0x11 & 1) == 0) {
-+        printk("[USB%d] eFuse not blown for usb\n", usb_n);
-+        usb_efuse = 0x98;
-+    }
-+    else {
-+        usb_efuse = (salina_glue_usb_phy_bar3_reg_read(0x44) >> (usb_n*5+0x10)) & 0x1f;
-+    }
-+    printk("This is the value of USB%d fuse: %05x\n", usb_n, usb_efuse);
-+
-+	salina_xhci_bar_reg_write(bar_offset, 0x800, 0x480a);
-+
-+    salina_xhci_bar_reg_write(bar_offset, 0x814, 0x10a01000);
-+
-+    val32 = salina_xhci_bar_reg_read(bar_offset, 0x818);
-+    salina_xhci_bar_reg_write(bar_offset, 0x818, val32 & 0xff7fffff);
-+
-+    val32 = salina_xhci_bar_reg_read(bar_offset, 0x800);
-+    salina_xhci_bar_reg_write(bar_offset, 0x800, val32 | 0x20);
-+
-+    val32 = salina_xhci_bar_reg_read(bar_offset, 0x868);
-+    salina_xhci_bar_reg_write(bar_offset, 0x868, val32 & 0xfffbffff);
-+
-+    val32 = salina_xhci_bar_reg_read(bar_offset, 0x804);
-+    salina_xhci_bar_reg_write(bar_offset, 0x804, (val32 & 0xff07ffff) | (usb_efuse<<0x13));
-+
-+    usb_length = usb_get_length(usb_n);
-+    printk("This is the value of USB%d usb_length: %05x\n", usb_n, usb_length);
-+
-+    val32 = salina_xhci_bar_reg_read(bar_offset, 0x818);
-+    salina_xhci_bar_reg_write(bar_offset, 0x818, (val32 & 0xffffff0f) | 0xa0);
-+
-+    val32 = salina_xhci_bar_reg_read(bar_offset, 0x818);
-+
-+    if (usb_length < 3)
-+        salina_xhci_bar_reg_write(bar_offset, 0x818, (val32 & 0xfffffff0) | 8);
-+    else if (usb_length < 6)
-+        salina_xhci_bar_reg_write(bar_offset, 0x818, (val32 & 0xfffffff0) | 7);
-+    else if (usb_length < 8)
-+        salina_xhci_bar_reg_write(bar_offset, 0x818, (val32 & 0xfffffff0) | 6);
-+    else if (usb_length < 10)
-+        salina_xhci_bar_reg_write(bar_offset, 0x818, (val32 & 0xfffffff0) | 5);
-+    else if (usb_length < 13)
-+        salina_xhci_bar_reg_write(bar_offset, 0x818, (val32 & 0xfffffff0) | 4);
-+    else {
-+        // Default values
-+        switch (usb_n) {
-+            case 0: salina_xhci_bar_reg_write(bar_offset, 0x818, (val32 & 0xfffffff0) | 4); break;
-+            case 1: salina_xhci_bar_reg_write(bar_offset, 0x818, (val32 & 0xfffffff0) | 6); break;
-+            case 2: salina_xhci_bar_reg_write(bar_offset, 0x818, (val32 & 0xfffffff0) | 7); break;
-+        }
-+    }
-+
-+    return 0;
++	val = salina_xhci_read(0, 0xc100);
++	salina_xhci_write(0, 0xc100, (val & 0xfffffff0) | 0xe);
++	salina_xhci_write(0, 0xc12c, 0x7fc0c010);
++	salina_xhci_write(0, 0xc200, 0x1548);
++	salina_xhci_write(0, 0xc204, 0x1548);
++	salina_xhci_write(0, 0xc208, 0x1548);
 +}
 +
-+int salina_usb_phy_config_step_2(u8 usb_n) {
++static void salina_xhci_toggle(u32 reg, u32 bit)
++{
++	u32 command = salina_xhci_read(SALINA_XHCI_CTRL_BASE, reg);
 +
-+    u64 bar_offset;
-+    u32 val32;
-+
-+    switch (usb_n) {
-+        case 0: bar_offset = 0x120000; break;
-+        case 1: bar_offset = 0x124000; break;
-+        case 2: bar_offset = 0x128000; break;
-+        default: bar_offset = 0x120000;
-+    }
-+
-+    val32 = salina_xhci_bar_reg_read(bar_offset, 0x814);
-+    salina_xhci_bar_reg_write(bar_offset, 0x814, val32 | 0x8000);
-+
-+    usleep_range(1,2);
-+
-+    val32 = salina_xhci_bar_reg_read(bar_offset, 0x110);
-+    salina_xhci_bar_reg_write(bar_offset, 0x110, val32 | 0x100);
-+
-+    val32 = salina_xhci_bar_reg_read(bar_offset, 0x100);
-+    salina_xhci_bar_reg_write(bar_offset, 0x100, (val32 & 0xff000000) | 0x400);
-+
-+    val32 = salina_xhci_bar_reg_read(bar_offset, 0x100);
-+    salina_xhci_bar_reg_write(bar_offset, 0x100, val32 | 0x1000000);
-+
-+    int attemps = 100;
-+    u32 measure;
-+    do {
-+        measure = salina_xhci_bar_reg_read(bar_offset, 0x10c);
-+        usleep_range(1,2);
-+        if (measure!=0) break;
-+        attemps--;
-+    } while(attemps!=0);
-+
-+    val32 = salina_xhci_bar_reg_read(bar_offset, 0x100);
-+    salina_xhci_bar_reg_write(bar_offset, 0x100, val32 & 0xfeffffff);
-+
-+    val32 = salina_xhci_bar_reg_read(bar_offset, 0x110);
-+    salina_xhci_bar_reg_write(bar_offset, 0x110, val32 & 0xfffffeff);
-+
-+    if (!measure) {
-+        printk("Something went wrong while waiting for USB init\n");
-+        return -1;
-+    }
-+    // usb2 TX slew rate calibration
-+    u32 calibration = (u32)((0xb9000 / (u64)measure) / 1000);
-+
-+    val32 = salina_xhci_bar_reg_read(bar_offset, 0x814);
-+    salina_xhci_bar_reg_write(bar_offset, 0x814, (val32 & 0xffff8fff) | (calibration<<12));
-+
-+    val32 = salina_xhci_bar_reg_read(bar_offset, 0x814);
-+    salina_xhci_bar_reg_write(bar_offset, 0x814, val32 & 0xffff7fff);
-+
-+    return 0;
++	salina_xhci_write(SALINA_XHCI_CTRL_BASE, reg, command | bit);
++	salina_xhci_write(SALINA_XHCI_CTRL_BASE, reg, command & ~bit);
 +}
 +
-+int salina_usb_phy_config_step_3(u8 usb_n) {
-+
-+    u64 bar_offset;
-+    u32 val32;
-+
-+    switch (usb_n) {
-+        case 0: bar_offset = 0x120000; break;
-+        case 1: bar_offset = 0x124000; break;
-+        case 2: bar_offset = 0x128000; break;
-+        default: bar_offset = 0x120000;
-+    }
-+
-+    val32 = salina_xhci_bar_reg_read(bar_offset, 0x800);
-+    salina_xhci_bar_reg_write(bar_offset, 0x800, val32 | 0x1);
-+
-+    val32 = salina_xhci_bar_reg_read(bar_offset, 0x808);
-+    salina_xhci_bar_reg_write(bar_offset, 0x808, val32 & 0xfffdffff);
-+
-+    val32 = salina_xhci_bar_reg_read(bar_offset, 0x880);
-+    salina_xhci_bar_reg_write(bar_offset, 0x880, val32 | 0x1);
-+
-+    return 0;
-+}
-+
-+int salina_usb_phy_config_step_4(void) {
-+    u32 val32 = salina_xhci_bar_reg_read(0, 0xc100);
-+    salina_xhci_bar_reg_write(0, 0xc100, (val32 & 0xfffffff0) | 0xe);
-+    salina_xhci_bar_reg_write(0, 0xc12c, 0x7fc0c010);
-+    salina_xhci_bar_reg_write(0, 0xc200, 0x1548);
-+    salina_xhci_bar_reg_write(0, 0xc204, 0x1548);
-+    salina_xhci_bar_reg_write(0, 0xc208, 0x1548);
-+    return 0;
-+}
-+
-+int xhci_salina_reset(struct xhci_hcd *xhci, u64 timeout_us) {
-+
-+    printk("Enter xhci_salina_reset()\n");
-+
++int xhci_salina_reset(struct xhci_hcd *xhci, u64 timeout_us)
++{
 +	u32 command;
 +	u32 state;
 +	int ret;
 +
-+    command = salina_xhci_bar_reg_read(0x100000, 0x0);
-+    salina_xhci_bar_reg_write(0x100000, 0x0, command & 0xfffffffb);   // Disable bit2
-+
++	command = salina_xhci_read(SALINA_XHCI_CTRL_BASE, 0x0);
++	salina_xhci_write(SALINA_XHCI_CTRL_BASE, 0x0, command & ~BIT(2));
 +
 +	state = readl(&xhci->op_regs->status);
-+
 +	if (state == ~(u32)0) {
 +		if (!(xhci->xhc_state & XHCI_STATE_DYING))
 +			xhci_warn(xhci, "Host not accessible, reset failed.\n");
@@ -354,336 +359,212 @@ index 000000000..7f10475e0
 +		return 0;
 +	}
 +
-+	printk("// Reset the HC on custom Salina Reset");
 +	writel(CMD_RESET, &xhci->op_regs->command);
++	udelay(1000);
 +
-+    udelay(1000);
-+
-+    ret = xhci_handshake(&xhci->op_regs->command, CMD_RESET, 0, timeout_us);
++	ret = xhci_handshake(&xhci->op_regs->command, CMD_RESET, 0, timeout_us);
 +	if (ret)
 +		return ret;
 +
-+    printk("Wait for controller to be ready for doorbell rings");
-+    ret = xhci_handshake(&xhci->op_regs->status, STS_CNR, 0, timeout_us);
++	ret = xhci_handshake(&xhci->op_regs->status, STS_CNR, 0, timeout_us);
 +	if (ret)
 +		return ret;
 +
-+    // Now custom part
-+    command = salina_xhci_bar_reg_read(0x100000, 0x0);
-+    salina_xhci_bar_reg_write(0x100000, 0x0, command | 0x2);        // Enable  bit1
-+    salina_xhci_bar_reg_write(0x100000, 0x0, command & 0xfffffffd); // Disable bit1
++	salina_xhci_toggle(0x0, BIT(1));
++	salina_xhci_toggle(0x0, BIT(17));
++	salina_xhci_toggle(0x0, BIT(25));
 +
-+    command = salina_xhci_bar_reg_read(0x100000, 0x0);
-+    salina_xhci_bar_reg_write(0x100000, 0x0, command | 0x20000);    // Enable  bit17
-+    salina_xhci_bar_reg_write(0x100000, 0x0, command & 0xfffdffff); // Disable bit17
++	usleep_range(30000, 31000);
 +
-+    command = salina_xhci_bar_reg_read(0x100000, 0x0);
-+    salina_xhci_bar_reg_write(0x100000, 0x0, command | 0x2000000);  // Enable  bit25
-+    salina_xhci_bar_reg_write(0x100000, 0x0, command & 0xfdffffff); // Disable bit25
++	command = salina_xhci_read(SALINA_XHCI_CTRL_BASE, 0x0);
++	salina_xhci_write(SALINA_XHCI_CTRL_BASE, 0x0, command & ~BIT(1));
 +
-+    udelay(10000);
-+    udelay(10000);
-+    udelay(10000);
++	usleep_range(20000, 21000);
 +
-+    command = salina_xhci_bar_reg_read(0x100000, 0x0);
-+    salina_xhci_bar_reg_write(0x100000, 0x0, command & 0xfffffffd); // Enable  bit1
++	command = salina_xhci_read(SALINA_XHCI_CTRL_BASE, 0x0);
++	salina_xhci_write(SALINA_XHCI_CTRL_BASE, 0x0, command | BIT(2));
 +
-+    udelay(10000);
-+    udelay(10000);
++	usleep_range(20000, 21000);
++	salina_usb_phy_config_step_4();
 +
-+    command = salina_xhci_bar_reg_read(0x100000, 0x0);
-+    salina_xhci_bar_reg_write(0x100000, 0x0, command | 4);          // Enable  bit2
-+
-+    udelay(10000);
-+    udelay(10000);
-+
-+    salina_usb_phy_config_step_4();
-+
-+    // Reset software state
-+    xhci->usb2_rhub.bus_state.port_c_suspend = 0;
++	xhci->usb2_rhub.bus_state.port_c_suspend = 0;
 +	xhci->usb2_rhub.bus_state.suspended_ports = 0;
 +	xhci->usb2_rhub.bus_state.resuming_ports = 0;
 +	xhci->usb3_rhub.bus_state.port_c_suspend = 0;
 +	xhci->usb3_rhub.bus_state.suspended_ports = 0;
 +	xhci->usb3_rhub.bus_state.resuming_ports = 0;
 +
-+    return 0;
++	return 0;
 +}
 +
-+int xhci_salina_init(struct pci_dev *pdev) {
++int xhci_salina_init(struct pci_dev *pdev)
++{
++	u32 val;
++	u8 port;
++	int ret;
 +
-+    int ret;
-+    u32 val32;
++	ret = salina_map_bars(pdev);
++	if (ret)
++		return ret;
 +
-+    printk("\n\n\n***** Module salina_usb_phy_init loaded *****\n");
++	val = salina_glue_phy_read(0x24);
++	salina_glue_phy_write(0x24, val | BIT(1));
 +
-+    ret = init_bars(pdev);
-+    if (ret) {
-+        pr_err("could not map BARs\n");
-+        return ret; // Esto evita el refcount: 1
-+    }
++	val = salina_glue_phy_read(0x24);
++	salina_glue_phy_write(0x24, val | BIT(0));
 +
-+    printk("Now trying to setup xhci Salina\n");
++	val = salina_glue_phy_read(0x24);
++	salina_glue_phy_write(0x24, val & ~BIT(1));
 +
-+    val32 = salina_glue_usb_phy_bar2_reg_read(0x24);
-+    salina_glue_usb_phy_bar2_reg_write(0x24, val32|2);
++	for (port = 0; port < 3; port++) {
++		ret = salina_usb_phy_config_step_1(port);
++		if (ret)
++			goto err_unmap;
++	}
 +
-+    val32 = salina_glue_usb_phy_bar2_reg_read(0x24);
-+    salina_glue_usb_phy_bar2_reg_write(0x24, val32|1);
++	val = salina_glue_phy_read(0x24);
++	salina_glue_phy_write(0x24, val & ~BIT(0));
 +
-+    // Start Config Bit 2
-+    val32 = salina_glue_usb_phy_bar2_reg_read(0x24);
-+    salina_glue_usb_phy_bar2_reg_write(0x24, val32 & 0xfffffffd);
++	udelay(2000);
 +
-+    if(salina_usb_phy_config_step_1(0)) return -1;
-+    if(salina_usb_phy_config_step_1(1)) return -1;
-+    if(salina_usb_phy_config_step_1(2)) return -1;
++	for (port = 0; port < 3; port++) {
++		ret = salina_usb_phy_config_step_2(port);
++		if (ret)
++			goto err_unmap;
++	}
 +
-+    // Start Config Bit 1
-+    val32 = salina_glue_usb_phy_bar2_reg_read(0x24);
-+    salina_glue_usb_phy_bar2_reg_write(0x24, val32 & 0xfffffffe);
++	for (port = 0; port < 3; port++) {
++		ret = salina_usb_phy_config_step_3(port);
++		if (ret)
++			goto err_unmap;
++	}
 +
-+    // Wait for init
-+    udelay(2000);
++	val = salina_xhci_read(SALINA_XHCI_CTRL_BASE, 0x4);
++	salina_xhci_write(SALINA_XHCI_CTRL_BASE, 0x4, val & ~BIT(0));
 +
-+    if(salina_usb_phy_config_step_2(0)) return -1;
-+    if(salina_usb_phy_config_step_2(1)) return -1;
-+    if(salina_usb_phy_config_step_2(2)) return -1;
++	salina_usb_phy_config_step_4();
++	dev_info(&pdev->dev, "PS5 Salina xHCI PHY initialized\n");
++	return 0;
 +
-+    if(salina_usb_phy_config_step_3(0)) return -1;
-+    if(salina_usb_phy_config_step_3(1)) return -1;
-+    if(salina_usb_phy_config_step_3(2)) return -1;
-+
-+    val32 = salina_xhci_bar_reg_read(0x100000, 0x4);
-+    salina_xhci_bar_reg_write(0x100000, 0x4, val32 & 0xfffffffe);
-+
-+    salina_usb_phy_config_step_4();
-+
-+    return 0;
++err_unmap:
++	salina_unmap_bars();
++	return ret;
 +}
 +
 +void xhci_salina_exit(void)
 +{
-+    unmap_bars();
++	salina_unmap_bars();
 +}
 +
-+int xhci_salina_cmd_ring_recover(struct xhci_hcd *xhci)
++static bool salina_event_pending(struct xhci_ring *ring)
 +{
-+    u64 crcr = xhci_read_64(xhci, &xhci->op_regs->cmd_ring);
++	struct xhci_segment *seg;
++	u32 index;
++	u32 control;
 +
-+    if (!(crcr & CMD_RING_RUNNING))
-+        return 0;
++	if (!ring || !ring->deq_seg || !ring->dequeue)
++		return false;
 +
-+    xhci_warn(xhci, "Salina: command ring running, recovering\n");
++	seg = ring->deq_seg;
++	index = ring->dequeue - seg->trbs;
++	if (index >= TRBS_PER_SEGMENT)
++		return false;
 +
-+    /* 1) Request stop */
-+    xhci_write_64(xhci, crcr | CMD_RING_ABORT, &xhci->op_regs->cmd_ring);
-+    udelay(1000); /* or a bounded poll */
-+
-+    /* 2) Reprogram CRCR to our ring base with RCS only */
-+    dma_addr_t base = xhci->cmd_ring->first_seg->dma;
-+    u64 restart = (u64)base | (xhci->cmd_ring->cycle_state ? CMD_RING_CYCLE : 0);
-+    xhci_write_64(xhci, restart, &xhci->op_regs->cmd_ring);
-+
-+    /* 3) Ring command doorbell */
-+    xhci_ring_cmd_db(xhci);
-+
-+    return 0;
++	control = le32_to_cpu(seg->trbs[index].generic.field[3]);
++	return !!((control & TRB_CYCLE) == ring->cycle_state);
 +}
 +
-+static void salina_xhci_poll_fn(struct work_struct *w)
++static void salina_xhci_poll_fn(struct work_struct *work)
 +{
-+    struct salina_xhci_poller *p =
-+        container_of(w, struct salina_xhci_poller, work.work);
-+    struct xhci_hcd *xhci = p->xhci;
-+    struct xhci_ring *er = xhci->interrupters[0]->event_ring;
++	struct salina_xhci_poller *poller;
++	struct xhci_hcd *xhci;
++	struct xhci_interrupter *ir;
 +	unsigned long flags;
++	bool resched = true;
 +
-+    if (!er)
-+        goto resched;
++	poller = container_of(work, struct salina_xhci_poller, work.work);
++	xhci = poller->xhci;
++	if (!poller->running || !xhci)
++		return;
 +
-+    // Try to get the lock like xhci_irq does. If it's busy, bail out immediately and retry later.
-+    if (!spin_trylock_irqsave(&xhci->lock, flags)) {
-+        printk(KERN_INFO "Salina poller: lock busy, rescheduling\n");
-+        goto resched;
-+    }
++	if (!spin_trylock_irqsave(&xhci->lock, flags))
++		goto out_resched;
 +
-+    u32 status = readl(&xhci->op_regs->status);
-+    if (status == ~(u32)0) {
-+        xhci_hc_died(xhci);
-+        goto unlock;
-+    }
++	if (xhci->xhc_state & (XHCI_STATE_DYING | XHCI_STATE_REMOVING)) {
++		resched = false;
++		goto out_unlock;
++	}
 +
-+    if (status & STS_HCE) {
-+        xhci_warn(xhci, "WARNING: Host Controller Error\n");
-+        xhci_halt(xhci);
-+        goto unlock;
-+    }
++	ir = xhci->interrupters[0];
++	if (ir && salina_event_pending(ir->event_ring))
++		xhci_handle_events(xhci, ir, false);
 +
-+    if (status & STS_FATAL) {
-+        xhci_warn(xhci, "WARNING: Host System Error\n");
-+        xhci_halt(xhci);
-+        goto unlock;
-+    }
-+
-+    {
-+        struct xhci_segment *seg = er->deq_seg;
-+        u32 idx = er->dequeue - er->deq_seg->trbs;
-+        u8 ccs = er->cycle_state;
-+        bool have_events = false;
-+
-+        if (seg) {
-+            u32 field3 = seg->trbs[idx].generic.field[3];
-+            u8 trb_cycle = field3 & 0x1;
-+
-+            if (trb_cycle == ccs)
-+                have_events = true;
-+        }
-+
-+        if (have_events) {
-+            u32 *trb_raw = (u32 *)&seg->trbs[idx];
-+            printk(KERN_INFO "Processing Event TRB [%03d] Virt: %p | RAW: %08x %08x %08x %08x\n",
-+                idx, &seg->trbs[idx],
-+                trb_raw[0], trb_raw[1], trb_raw[2], trb_raw[3]);
-+            xhci_handle_events(xhci, xhci->interrupters[0], false);
-+        }
-+    }
-+
-+unlock:
-+    spin_unlock_irqrestore(&xhci->lock, flags);
-+
-+resched:
-+    schedule_delayed_work(&p->work,
-+        msecs_to_jiffies(SALINA_POLL_INTERVAL_MS));
++out_unlock:
++	spin_unlock_irqrestore(&xhci->lock, flags);
++out_resched:
++	if (resched && poller->running)
++		schedule_delayed_work(&poller->work,
++				      msecs_to_jiffies(SALINA_POLL_INTERVAL_MS));
 +}
 +
 +void salina_start_xhci_poller(struct xhci_hcd *xhci)
 +{
-+    memset(&salina_poll, 0, sizeof(salina_poll));
-+    salina_poll.xhci = xhci;
++	if (salina_poll.running)
++		return;
 +
-+    INIT_DELAYED_WORK(&salina_poll.work, salina_xhci_poll_fn);
-+
-+    schedule_delayed_work(&salina_poll.work,
-+                  msecs_to_jiffies(SALINA_POLL_INTERVAL_MS));
-+
-+    xhci_info(xhci, "Salina: software IRQ poller enabled\n");
++	salina_poll.xhci = xhci;
++	salina_poll.running = true;
++	INIT_DELAYED_WORK(&salina_poll.work, salina_xhci_poll_fn);
++	schedule_delayed_work(&salina_poll.work,
++			      msecs_to_jiffies(SALINA_POLL_INTERVAL_MS));
++	xhci_info(xhci, "Salina software IRQ poller enabled\n");
 +}
 +
 +void salina_stop_xhci_poller(void)
 +{
-+    cancel_delayed_work_sync(&salina_poll.work);
-+}
++	if (!salina_poll.running)
++		return;
 +
-+// Helpers
-+static void xhci_dump_trb(const char *tag, struct xhci_generic_trb *trb)
-+{
-+    u32 lo = le32_to_cpu(trb->field[0]);
-+    u32 hi = le32_to_cpu(trb->field[1]);
-+    u32 sts = le32_to_cpu(trb->field[2]);
-+    u32 flg = le32_to_cpu(trb->field[3]);
-+
-+    printk("%s: %08x %08x %08x %08x\n", tag, lo, hi, sts, flg);
-+}
-+
-+static void xhci_salina_dump_ring(const char *name, struct xhci_ring *ring)
-+{
-+    int i;
-+    struct xhci_segment *seg;
-+    struct xhci_generic_trb *trb;
-+
-+    if (!ring) {
-+        printk("Salina: %s ring NULL\n", name);
-+        return;
-+    }
-+
-+    printk("Salina: dumping %s ring: ring=%p, dequeue=%p, cycle=%d\n",
-+        name, ring, ring->dequeue, ring->cycle_state);
-+
-+    seg = ring->first_seg;
-+    for (i = 0; i < TRBS_PER_SEGMENT; i++) {
-+        trb = (struct xhci_generic_trb*) &seg->trbs[i];
-+        xhci_dump_trb(name, trb);
-+    }
-+}
-+
-+void xhci_salina_dump_state(struct xhci_hcd *xhci, struct xhci_interrupter *ir)
-+{
-+    struct xhci_ring *cmd = xhci->cmd_ring;
-+
-+    printk("Salina: dumping xHCI state (cmd + event rings)\n");
-+
-+    xhci_salina_dump_ring("CMD", cmd);
-+    xhci_salina_dump_ring("EVT", ir->event_ring);
++	salina_poll.running = false;
++	cancel_delayed_work_sync(&salina_poll.work);
++	salina_poll.xhci = NULL;
 +}
 diff --git a/drivers/usb/host/xhci-ps5.h b/drivers/usb/host/xhci-ps5.h
 new file mode 100644
-index 000000000..764cc1552
+index 000000000000..111111111111
 --- /dev/null
 +++ b/drivers/usb/host/xhci-ps5.h
-@@ -0,0 +1,47 @@
-+// Special code to apply quirks for the Salina xhci
+@@ -0,0 +1,17 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef __XHCI_PS5_H
++#define __XHCI_PS5_H
++
 +#include <linux/pci.h>
-+#include <linux/io.h>
-+#include <linux/usb.h>
-+#include <linux/usb/hcd.h>
-+#include "xhci.h"
 +
-+#define PCI_VENDOR_ID_SONY						0x104d
-+#define PCI_DEVICE_ID_PS5_SALINA_GLUE			0x9107
-+#define PCI_DEVICE_ID_PS5_SALINA_XHCI			0x9108
++struct xhci_hcd;
 +
-+#define SALINA_GLUE_BAR2        0x85200000
-+#define SALINA_GLUE_BAR2_SIZE   0x190000
-+#define SALINA_GLUE_BAR3        0x85400000
-+#define SALINA_GLUE_BAR3_SIZE   0x200000
++#define PCI_DEVICE_ID_PS5_SALINA_XHCI	0x9108
 +
-+#define SALINA_XHCI_BAR        0x85600000
-+#define SALINA_XHCI_BAR_SIZE   0x140000
-+
-+void __iomem * map_bar(resource_size_t phys_addr, unsigned long size);
-+int init_bars(struct pci_dev *own_pdev);
-+void unmap_bars(void);
-+u32 phys_readl(u64 addr);
-+u8 usb_get_length(u8 usb_n);
-+u32 salina_glue_bar2_read(u32 addr);
-+void salina_glue_bar2_write(u32 addr, u32 val);
-+u32 salina_glue_usb_phy_bar2_reg_read(u32 reg);
-+void salina_glue_usb_phy_bar2_reg_write(u32 reg, u32 val);
-+u32 salina_glue_bar3_read(u32 addr);
-+void salina_glue_bar3_write(u32 addr, u32 val);
-+u32 salina_glue_usb_phy_bar3_reg_read(u32 reg);
-+void salina_glue_usb_phy_bar3_reg_write(u32 reg, u32 val);
-+u32 salina_xhci_bar_reg_read(u64 offset, u32 reg);
-+void salina_xhci_bar_reg_write(u64 offset, u32 reg, u32 val);
-+int salina_usb_phy_config_step_1(u8 usb_n);
-+int salina_usb_phy_config_step_2(u8 usb_n);
-+int salina_usb_phy_config_step_3(u8 usb_n);
-+int salina_usb_phy_config_step_4(void);
-+int xhci_salina_reset(struct xhci_hcd *xhci, u64 timeout_us);
 +int xhci_salina_init(struct pci_dev *pdev);
 +void xhci_salina_exit(void);
-+int xhci_salina_cmd_ring_recover(struct xhci_hcd *xhci);
-+
++int xhci_salina_reset(struct xhci_hcd *xhci, u64 timeout_us);
 +void salina_start_xhci_poller(struct xhci_hcd *xhci);
 +void salina_stop_xhci_poller(void);
 +
-+void xhci_salina_dump_state(struct xhci_hcd *xhci, struct xhci_interrupter *ir);
-\ No newline at end of file
++#endif /* __XHCI_PS5_H */
 diff --git a/drivers/usb/host/xhci-ring.c b/drivers/usb/host/xhci-ring.c
-index 1cbefee3c..aced3384f 100644
+index 1cbefee3c..827d7ea21 100644
 --- a/drivers/usb/host/xhci-ring.c
 +++ b/drivers/usb/host/xhci-ring.c
-@@ -59,6 +59,8 @@
+@@ -59,6 +59,7 @@
  #include <linux/dma-mapping.h>
  #include "xhci.h"
  #include "xhci-trace.h"
 +#include "xhci-ring.h"
-+#include "xhci-ps5.h"
  
  static int queue_command(struct xhci_hcd *xhci, struct xhci_command *cmd,
  			 u32 field1, u32 field2,
-@@ -3083,12 +3085,14 @@ static void xhci_clear_interrupt_pending(struct xhci_interrupter *ir)
+@@ -3083,7 +3084,7 @@ static void xhci_clear_interrupt_pending(struct xhci_interrupter *ir)
   * Handle all OS-owned events on an interrupter event ring. It may drop
   * and reaquire xhci->lock between event processing.
   */
@@ -692,67 +573,24 @@ index 1cbefee3c..aced3384f 100644
  			      bool skip_events)
  {
  	int event_loop = 0;
- 	int err = 0;
- 	u64 temp;
-+	int iters = 0;
-+	const int max_iters = 32; // To avoid stuck on while for Salina
- 
- 	xhci_clear_interrupt_pending(ir);
- 
-@@ -3110,6 +3114,8 @@ static int xhci_handle_events(struct xhci_hcd *xhci, struct xhci_interrupter *ir
- 
- 	/* Process all OS owned event TRBs on this event ring */
- 	while (unhandled_event_trb(ir->event_ring)) {
-+		if (xhci->quirks & XHCI_PS5_SALINA_PHY)
-+			printk(KERN_INFO "Running xhci_handle_events iteration %03d\n", iters);
- 		if (!skip_events)
- 			err = xhci_handle_event_trb(xhci, ir, ir->event_ring->dequeue);
- 
-@@ -3131,11 +3137,31 @@ static int xhci_handle_events(struct xhci_hcd *xhci, struct xhci_interrupter *ir
- 
- 		if (err)
- 			break;
-+
-+		if (xhci->quirks & XHCI_PS5_SALINA_PHY) {
-+			if (++iters > max_iters) {
-+	            xhci_warn(xhci,
-+	                  "Salina: event ring appears stuck after %d TRBs, dumping rings\n",
-+	                  iters);
-+	            goto salina_stuck;
-+	        }
-+		}
- 	}
- 
- 	xhci_update_erst_dequeue(xhci, ir, true);
--
-+	if (xhci->quirks & XHCI_PS5_SALINA_PHY)
-+		printk(KERN_INFO "Returning from xhci_handle_events\n");
- 	return 0;
-+
-+salina_stuck:
-+    /* mark host dying so we don't deadlock future URBs */
-+    xhci->xhc_state |= XHCI_STATE_DYING;
-+
-+    /* dump rings for debugging */
-+    xhci_salina_dump_state(xhci, ir);
-+
-+    xhci_update_erst_dequeue(xhci, ir, true);
-+    return -EIO;
- }
- 
- /*
 diff --git a/drivers/usb/host/xhci-ring.h b/drivers/usb/host/xhci-ring.h
 new file mode 100644
-index 000000000..193ac03a3
+index 000000000000..111111111111
 --- /dev/null
 +++ b/drivers/usb/host/xhci-ring.h
-@@ -0,0 +1,4 @@
+@@ -0,0 +1,10 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef __XHCI_RING_H
++#define __XHCI_RING_H
++
 +#include "xhci.h"
 +
-+dma_addr_t xhci_trb_virt_to_dma(struct xhci_segment *seg, union xhci_trb *trb);
-+int xhci_handle_events(struct xhci_hcd *xhci, struct xhci_interrupter *ir, bool skip_events);
++int xhci_handle_events(struct xhci_hcd *xhci, struct xhci_interrupter *ir,
++			       bool skip_events);
++
++#endif /* __XHCI_RING_H */
 diff --git a/drivers/usb/host/xhci-pci.c b/drivers/usb/host/xhci-pci.c
-index 83af325b7..3198490a7 100644
+index 83af325b7..f4a98bb37 100644
 --- a/drivers/usb/host/xhci-pci.c
 +++ b/drivers/usb/host/xhci-pci.c
 @@ -16,6 +16,7 @@
@@ -763,7 +601,7 @@ index 83af325b7..3198490a7 100644
  
  #define SSIC_PORT_NUM		2
  #define SSIC_PORT_CFG2		0x880c
-@@ -285,6 +286,11 @@ static void xhci_pci_quirks(struct device *dev, struct xhci_hcd *xhci)
+@@ -285,6 +286,10 @@ static void xhci_pci_quirks(struct device *dev, struct xhci_hcd *xhci)
  	if (pdev->vendor == PCI_VENDOR_ID_NEC)
  		xhci->quirks |= XHCI_NEC_HOST;
  
@@ -804,7 +642,7 @@ diff --git a/drivers/usb/host/Makefile b/drivers/usb/host/Makefile
 index 93d989e73..bf3b363be 100644
 --- a/drivers/usb/host/Makefile
 +++ b/drivers/usb/host/Makefile
-@@ -13,6 +13,7 @@ xhci-hcd-y := xhci.o xhci-mem.o xhci-ext-caps.o
+@@ -13,5 +13,6 @@ xhci-hcd-y := xhci.o xhci-mem.o xhci-ext-caps.o
  xhci-hcd-y += xhci-ring.o xhci-hub.o xhci-dbg.o
  xhci-hcd-y += xhci-trace.o
 +xhci-hcd-y += xhci-ps5.o
@@ -812,7 +650,7 @@ index 93d989e73..bf3b363be 100644
  ifneq ($(CONFIG_USB_XHCI_DBGCAP), )
  	xhci-hcd-y += xhci-dbgcap.o xhci-dbgtty.o
 diff --git a/drivers/usb/host/xhci.c b/drivers/usb/host/xhci.c
-index 8d8f0865f..b34b64f90 100644
+index 8d8f0865f..ddba98f72 100644
 --- a/drivers/usb/host/xhci.c
 +++ b/drivers/usb/host/xhci.c
 @@ -26,6 +26,7 @@
@@ -823,48 +661,35 @@ index 8d8f0865f..b34b64f90 100644
  
  #define DRIVER_AUTHOR "Sarah Sharp"
  #define DRIVER_DESC "'eXtensible' Host Controller (xHC) Driver"
-@@ -191,6 +192,11 @@ int xhci_reset(struct xhci_hcd *xhci, u64 timeout_us)
+@@ -191,6 +192,9 @@ int xhci_reset(struct xhci_hcd *xhci, u64 timeout_us)
  	u32 state;
  	int ret;
  
-+	// On Salina defer to our implementation
-+	if (xhci->quirks & XHCI_PS5_SALINA_PHY) {
-+		return xhci_salina_reset(xhci, 5000);
-+	}
++	if (xhci->quirks & XHCI_PS5_SALINA_PHY)
++		return xhci_salina_reset(xhci, max_t(u64, timeout_us, 5000));
 +
  	state = readl(&xhci->op_regs->status);
  
  	if (state == ~(u32)0) {
-@@ -625,6 +631,11 @@ static int xhci_run_finished(struct xhci_hcd *xhci)
+@@ -625,6 +629,9 @@ static int xhci_run_finished(struct xhci_hcd *xhci)
  
  	spin_unlock_irqrestore(&xhci->lock, flags);
  
-+	// Start "IRQ" poller for Salina
-+	if(xhci->quirks & XHCI_PS5_SALINA_PHY) {
++	if (xhci->quirks & XHCI_PS5_SALINA_PHY)
 +		salina_start_xhci_poller(xhci);
-+	}
 +
  	return 0;
  }
  
 diff --git a/drivers/usb/host/xhci.h b/drivers/usb/host/xhci.h
-index 2b0796f6d..d0893b635 100644
+index 2b0796f6d..bd87b8561 100644
 --- a/drivers/usb/host/xhci.h
 +++ b/drivers/usb/host/xhci.h
-@@ -1461,7 +1461,7 @@ struct xhci_interrupter {
-  * It can take up to 20 ms to transition from RExit to U0 on the
-  * Intel Lynx Point LP xHCI host.
-  */
--#define	XHCI_MAX_REXIT_TIMEOUT_MS	20
-+#define	XHCI_MAX_REXIT_TIMEOUT_MS	5000
- struct xhci_port_cap {
- 	u32			*psi;	/* array of protocol speed ID entries */
- 	u8			psi_count;
 @@ -1644,6 +1644,7 @@ struct xhci_hcd {
  #define XHCI_CDNS_SCTX_QUIRK	BIT_ULL(48)
  #define XHCI_ETRON_HOST	BIT_ULL(49)
  #define XHCI_LIMIT_ENDPOINT_INTERVAL_9 BIT_ULL(50)
-+#define XHCI_PS5_SALINA_PHY BIT_ULL(51)
++#define XHCI_PS5_SALINA_PHY	BIT_ULL(51)
  
  	unsigned int		num_active_eps;
  	unsigned int		limit_active_eps;
@@ -879,11 +704,11 @@ index 5c535f3ab..a4b587ad8 100644
 +#define BTUSB_IFNUM_0			BIT(29)
 +#define BTUSB_BROKEN_LE_DEFAULT_PHY	BIT(30)
 +#define BTUSB_BROKEN_READ_LOCAL_NAME	BIT(31)
-+#define BTUSB_NO_AUTOSUSPEND		BIT(32)
++#define BTUSB_NO_AUTOSUSPEND		BIT_ULL(32)
  
  static const struct usb_device_id btusb_table[] = {
  	/* Generic Bluetooth USB device */
-@@ -80,6 +84,13 @@ static const struct usb_device_id btusb_table[] = {
+@@ -80,5 +84,12 @@ static const struct usb_device_id btusb_table[] = {
  	{ USB_DEVICE_INFO(0xe0, 0x01, 0x04), .driver_info = BTUSB_AMP },
  
 +	/* PS5 IW620 Bluetooth device */
@@ -896,7 +721,7 @@ index 5c535f3ab..a4b587ad8 100644
  	/* Generic Bluetooth USB interface */
  	{ USB_INTERFACE_INFO(0xe0, 0x01, 0x01) },
  
-@@ -472,6 +476,12 @@ static const struct usb_device_id quirks_table[] = {
+@@ -472,6 +483,11 @@ static const struct usb_device_id quirks_table[] = {
  	{ USB_DEVICE(0x1286, 0x2044), .driver_info = BTUSB_MARVELL },
  	{ USB_DEVICE(0x1286, 0x2046), .driver_info = BTUSB_MARVELL },
  	{ USB_DEVICE(0x1286, 0x204e), .driver_info = BTUSB_MARVELL },
@@ -908,7 +733,7 @@ index 5c535f3ab..a4b587ad8 100644
  
  	/* Intel Bluetooth devices */
  	{ USB_DEVICE(0x8087, 0x0025), .driver_info = BTUSB_INTEL_COMBINED },
-@@ -4033,11 +4043,6 @@ static int btusb_probe(struct usb_interface *intf,
+@@ -4033,11 +4050,6 @@ static int btusb_probe(struct usb_interface *intf,
  
  	BT_DBG("intf %p id %p", intf, id);
  
@@ -920,7 +745,7 @@ index 5c535f3ab..a4b587ad8 100644
  	ifnum_base = intf->cur_altsetting->desc.bInterfaceNumber;
  
  	if (!id->driver_info) {
-@@ -4048,6 +4053,15 @@ static int btusb_probe(struct usb_interface *intf,
+@@ -4048,6 +4060,15 @@ static int btusb_probe(struct usb_interface *intf,
  			id = match;
  	}
  
@@ -936,7 +761,7 @@ index 5c535f3ab..a4b587ad8 100644
  	if (id->driver_info == BTUSB_IGNORE)
  		return -ENODEV;
  
-@@ -4344,6 +4358,12 @@ static int btusb_probe(struct usb_interface *intf,
+@@ -4344,6 +4365,12 @@ static int btusb_probe(struct usb_interface *intf,
  	if (id->driver_info & BTUSB_INVALID_LE_STATES)
  		hci_set_quirk(hdev, HCI_QUIRK_BROKEN_LE_STATES);
  
@@ -949,7 +774,7 @@ index 5c535f3ab..a4b587ad8 100644
  	if (id->driver_info & BTUSB_DIGIANSWER) {
  		data->cmdreq_type = USB_TYPE_VENDOR;
  		hci_set_quirk(hdev, HCI_QUIRK_RESET_ON_CLOSE);
-@@ -4418,7 +4438,7 @@ static int btusb_probe(struct usb_interface *intf,
+@@ -4418,7 +4445,7 @@ static int btusb_probe(struct usb_interface *intf,
  			data->diag = NULL;
  	}
  

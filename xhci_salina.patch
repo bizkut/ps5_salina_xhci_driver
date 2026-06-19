@@ -883,6 +883,19 @@ index 5c535f3ab..a4b587ad8 100644
  
  static const struct usb_device_id btusb_table[] = {
  	/* Generic Bluetooth USB device */
+@@ -80,6 +84,13 @@ static const struct usb_device_id btusb_table[] = {
+ 	{ USB_DEVICE_INFO(0xe0, 0x01, 0x04), .driver_info = BTUSB_AMP },
+ 
++	/* PS5 IW620 Bluetooth device */
++	{ USB_DEVICE(0x1286, 0x2059), .driver_info = BTUSB_MARVELL |
++						     BTUSB_IFNUM_0 |
++						     BTUSB_BROKEN_LE_DEFAULT_PHY |
++						     BTUSB_BROKEN_READ_LOCAL_NAME |
++						     BTUSB_NO_AUTOSUSPEND },
++
+ 	/* Generic Bluetooth USB interface */
+ 	{ USB_INTERFACE_INFO(0xe0, 0x01, 0x01) },
+ 
 @@ -472,6 +476,12 @@ static const struct usb_device_id quirks_table[] = {
  	{ USB_DEVICE(0x1286, 0x2044), .driver_info = BTUSB_MARVELL },
  	{ USB_DEVICE(0x1286, 0x2046), .driver_info = BTUSB_MARVELL },
